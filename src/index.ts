@@ -3,6 +3,8 @@ import express, { Request, Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { oauthRouter } from "./oauth/routes.js";
 import { createMcpServer } from "./mcp-server.js";
+import { GocApiClient } from "./api-client.js";
+import { McpTracker } from "./tracker.js";
 
 const app = express();
 app.use(express.json());
@@ -23,14 +25,16 @@ app.post("/mcp", async (req: Request, res: Response) => {
       jsonrpc: "2.0",
       error: {
         code: -32001,
-        message: "Unauthorized: se requiere un Bearer token. Autentícate primero.",
+        message: "Unauthorized: Bearer token required. Please authenticate first.",
       },
       id: null,
     });
     return;
   }
 
-  const server = createMcpServer(jwt);
+  const client = new GocApiClient(jwt);
+  const tracker = new McpTracker(client);
+  const server = createMcpServer(client, tracker);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   try {

@@ -13,11 +13,11 @@ export function renderLoginPage(params: LoginPageParams): string {
     : "";
 
   return `<!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GOC — Iniciar sesión</title>
+  <title>GOC — Sign in</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -92,17 +92,17 @@ export function renderLoginPage(params: LoginPageParams): string {
 <body>
   <div class="card">
     <div class="logo">GOC</div>
-    <div class="subtitle">Inicia sesión para conectar Claude con tu cuenta</div>
+    <div class="subtitle">Sign in to connect Claude with your account</div>
     ${errorBlock}
     <form method="POST" action="/oauth/login-action">
       <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
       <input type="hidden" name="state" value="${escapeHtml(state)}">
       <input type="hidden" name="client_id" value="${escapeHtml(client_id)}">
-      <label for="username">Usuario</label>
-      <input type="text" id="username" name="username" required autofocus placeholder="nombre de usuario">
-      <label for="password">Contraseña</label>
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required autofocus placeholder="username">
+      <label for="password">Password</label>
       <input type="password" id="password" name="password" required placeholder="••••••••">
-      <button type="submit">Iniciar sesión</button>
+      <button type="submit">Sign in</button>
     </form>
   </div>
 </body>

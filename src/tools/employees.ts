@@ -1,50 +1,60 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GocApiClient } from "../api-client.js";
+import { McpTracker } from "../tracker.js";
+import { withTracking } from "../tool-wrapper.js";
 
-export function registerEmployeeTools(server: McpServer, client: GocApiClient): void {
+const ANNOTATIONS = { readOnlyHint: true, destructiveHint: false, idempotentHint: true } as const;
+
+export function registerEmployeeTools(server: McpServer, client: GocApiClient, tracker: McpTracker): void {
   server.registerTool(
     "employee_search",
     {
-      description: "Buscar empleados por nombre. Devuelve una lista de empleados que coinciden con el término de búsqueda.",
+      title: "Employee Search",
+      description: "Search employees by name. Returns a list of employees matching the search term.",
+      annotations: ANNOTATIONS,
       inputSchema: {
-        query: z.string().describe("Nombre o apellido del empleado a buscar"),
+        query: z.string().describe("Employee first or last name to search"),
       },
     },
-    async ({ query }) => {
+    withTracking("employee_search", client, tracker, async ({ query }) => {
       const data = await client.get("/employees/search", { q: query });
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    })
   );
 
   server.registerTool(
     "employee_detail",
     {
-      description: "Obtener información completa de un empleado: datos personales, categoría, estatus laboral, proyecto asignado, documentos.",
+      title: "Employee Detail",
+      description: "Get full employee information: personal data, category, employment status, assigned project, and documents.",
+      annotations: ANNOTATIONS,
       inputSchema: {
-        id: z.string().describe("ID del empleado"),
+        id: z.string().describe("Employee ID"),
       },
     },
-    async ({ id }) => {
+    withTracking("employee_detail", client, tracker, async ({ id }) => {
       const data = await client.get(`/employees/${id}`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    })
   );
 
   server.registerTool(
     "employee_list",
     {
-      description: "Listar empleados con filtros opcionales. Devuelve empleados paginados.",
+      title: "Employee List",
+      description: "List employees with optional filters. Returns paginated employees.",
+      annotations: ANNOTATIONS,
       inputSchema: {
-        project_id: z.string().optional().describe("Filtrar por ID de obra/proyecto"),
-        employment_status: z.string().optional().describe("Filtrar por estatus (ej: ACTIVE, INACTIVE)"),
-        page: z.number().optional().describe("Número de página (por defecto 1)"),
-        limit: z.number().optional().describe("Resultados por página (por defecto 20)"),
+        project_id: z.string().optional().describe("Filter by project ID"),
+        employment_status: z.string().optional().describe("Filter by status (e.g. ACTIVE, INACTIVE)"),
+        page: z.number().optional().describe("Page number (default 1)"),
+        limit: z.number().optional().describe("Results per page (default 20)"),
       },
     },
-    async (params) => {
+    withTracking("employee_list", client, tracker, async (params) => {
       const data = await client.get("/employees", params);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
+    })
   );
 }
