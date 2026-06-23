@@ -2,6 +2,7 @@ import { Router } from "express";
 import axios from "axios";
 import { renderLoginPage } from "./login-page.js";
 import { createCode, redeemCode, generateRefreshToken } from "./store.js";
+import { registerOAuthClientInApi, getClientTrackingMetadata } from "./client-registry.js";
 import { GocApiClient } from "../api-client.js";
 import { McpTracker } from "../tracker.js";
 
@@ -39,7 +40,7 @@ oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
   });
 });
 
-oauthRouter.post("/oauth/register", (req, res) => {
+oauthRouter.post("/oauth/register", async (req, res) => {
   const { redirect_uris, client_name, token_endpoint_auth_method } = req.body as Record<string, unknown>;
 
   if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
@@ -48,10 +49,30 @@ oauthRouter.post("/oauth/register", (req, res) => {
   }
 
   const client_id = crypto.randomUUID();
+  const resolvedClientName = typeof client_name === "string" && client_name.trim()
+    ? client_name.trim()
+    : "MCP Client";
+
+  try {
+    await registerOAuthClientInApi({
+      clientId: client_id,
+      clientName: resolvedClientName,
+      redirectUris: redirect_uris as string[],
+      tokenEndpointAuthMethod: typeof token_endpoint_auth_method === "string"
+        ? token_endpoint_auth_method
+        : "none",
+    });
+  } catch {
+    res.status(500).json({
+      error: "server_error",
+      error_description: "Could not persist OAuth client registration",
+    });
+    return;
+  }
 
   res.status(201).json({
     client_id,
-    client_name: client_name ?? "MCP Client",
+    client_name: resolvedClientName,
     redirect_uris,
     token_endpoint_auth_method: token_endpoint_auth_method ?? "none",
     grant_types: ["authorization_code", "refresh_token"],
@@ -94,12 +115,14 @@ oauthRouter.post("/oauth/login-action", async (req, res) => {
     res.redirect(callbackUrl);
   } catch (err: unknown) {
     const message = extractErrorMessage(err);
+    const clientMeta = await getClientTrackingMetadata(client_id);
 
     // Fire-and-forget: log auth failure event
     logEventSafe(undefined, {
       eventType: "auth_failure",
       clientId: client_id,
-      description: `Login failed for user "${req.body?.username ?? "unknown"}": ${message}`,
+      description: `Login failed for user "${req.body?.username ?? "unknown"}" (${clientMeta.client_name ?? "unknown agent"}): ${message}`,
+      metadata: clientMeta,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
     });
@@ -126,23 +149,26 @@ oauthRouter.post("/oauth/token", async (req, res) => {
     }
 
     const mcpRefreshToken = generateRefreshToken();
+    const clientMeta = await getClientTrackingMetadata(client_id);
 
     // Fire-and-forget: create session and log event in the API
     const apiClient = new GocApiClient(result.jwt);
     const tracker = new McpTracker(apiClient);
 
-    tracker.createSession({
+    await tracker.createSession({
       mcpRefreshToken,
       gocRefreshToken: result.gocRefreshToken,
       clientId: client_id,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
+      metadata: clientMeta,
     }).catch(() => {});
 
     tracker.logEvent({
       eventType: "auth_success",
       clientId: client_id,
-      description: "User authenticated via OAuth authorization code",
+      description: `User authenticated via OAuth (${clientMeta.client_name ?? "unknown agent"})`,
+      metadata: clientMeta,
       ipAddress: req.ip,
       userAgent: req.headers["user-agent"],
     });
@@ -162,6 +188,8 @@ oauthRouter.post("/oauth/token", async (req, res) => {
       res.status(400).json({ error: "invalid_request", error_description: "Missing refresh_token" });
       return;
     }
+
+    const clientMeta = await getClientTrackingMetadata(client_id);
 
     // Look up the session in the API to get the GOC refresh token
     // We need a JWT to call the API, but we only have the expired one.
@@ -203,7 +231,9 @@ oauthRouter.post("/oauth/token", async (req, res) => {
       if (!newJwt) {
         tracker.logEvent({
           eventType: "token_refresh_failed",
-          description: "GOC API did not return a new token",
+          clientId: client_id,
+          metadata: clientMeta,
+          description: `GOC API did not return a new token (${clientMeta.client_name ?? "unknown agent"})`,
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
         });
@@ -216,10 +246,17 @@ oauthRouter.post("/oauth/token", async (req, res) => {
       // Update session with new tokens
       const newApiClient = new GocApiClient(newJwt);
       const newTracker = new McpTracker(newApiClient);
+      newTracker.bindSession(session.id);
+      newTracker.setRequestContext({
+        ipAddress: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
 
       newTracker.logEvent({
         eventType: "token_refresh",
-        description: "Token refreshed successfully",
+        clientId: client_id,
+        metadata: clientMeta,
+        description: `Token refreshed (${clientMeta.client_name ?? "unknown agent"})`,
         ipAddress: req.ip,
         userAgent: req.headers["user-agent"],
       });
@@ -241,7 +278,9 @@ oauthRouter.post("/oauth/token", async (req, res) => {
     } catch {
       tracker.logEvent({
         eventType: "token_refresh_failed",
-        description: "Upstream refresh failed — user must re-authenticate",
+        clientId: client_id,
+        metadata: clientMeta,
+        description: `Upstream refresh failed (${clientMeta.client_name ?? "unknown agent"}) — user must re-authenticate`,
         ipAddress: req.ip,
         userAgent: req.headers["user-agent"],
       });
@@ -272,11 +311,14 @@ oauthRouter.post("/oauth/revoke", (req, res) => {
   const tracker = new McpTracker(apiClient);
 
   tracker.findSessionByToken(token)
-    .then((session) => {
+    .then(async (session) => {
       if (session) {
+        tracker.bindSession(session.id);
         tracker.updateSession(session.id, { status: "revoked" }).catch(() => {});
         tracker.logEvent({
           eventType: "token_revoked",
+          clientId: session.clientId ?? undefined,
+          metadata: await getClientTrackingMetadata(session.clientId ?? undefined),
           description: "User disconnected via OAuth revocation",
           ipAddress: req.ip,
           userAgent: req.headers["user-agent"],
@@ -309,6 +351,7 @@ function logEventSafe(jwt: string | undefined, event: {
   eventType: string;
   clientId?: string;
   description?: string;
+  metadata?: Record<string, string>;
   ipAddress?: string;
   userAgent?: string;
 }): void {
