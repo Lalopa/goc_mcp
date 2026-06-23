@@ -5,8 +5,10 @@ import { oauthRouter } from "./oauth/routes.js";
 import { createMcpServer } from "./mcp-server.js";
 import { GocApiClient } from "./api-client.js";
 import { McpTracker } from "./tracker.js";
+import { extractMcpRequestId } from "./tracking-context.js";
 
 const app = express();
+app.set("trust proxy", true);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -63,6 +65,13 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   const client = new GocApiClient(jwt);
   const tracker = new McpTracker(client);
+  tracker.setRequestContext({
+    ipAddress: req.ip,
+    userAgent: req.headers["user-agent"],
+    mcpRequestId: extractMcpRequestId(req.body),
+  });
+  await tracker.resolveActiveSession();
+
   const server = createMcpServer(client, tracker);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
