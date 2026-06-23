@@ -18,10 +18,12 @@ oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
     authorization_endpoint: `${MCP_BASE_URL}/oauth/authorize`,
     token_endpoint: `${MCP_BASE_URL}/oauth/token`,
     registration_endpoint: `${MCP_BASE_URL}/oauth/register`,
+    revocation_endpoint: `${MCP_BASE_URL}/oauth/revoke`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
+    revocation_endpoint_auth_methods_supported: ["none"],
     scopes_supported: ["read"],
   });
 });
@@ -239,6 +241,41 @@ oauthRouter.post("/oauth/token", async (req, res) => {
   }
 
   res.status(400).json({ error: "unsupported_grant_type" });
+});
+
+// --- Token revocation (RFC 7009) ---
+// Claude uses this to show Disconnect button
+oauthRouter.post("/oauth/revoke", (req, res) => {
+  const { token } = req.body as Record<string, string>;
+
+  if (!token) {
+    res.status(200).json({});
+    return;
+  }
+
+  // Try to invalidate the session in the API using the token as auth
+  const authHeader = req.headers.authorization ?? "";
+  const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : token;
+
+  const apiClient = new GocApiClient(jwt);
+  const tracker = new McpTracker(apiClient);
+
+  tracker.findSessionByToken(token)
+    .then((session) => {
+      if (session) {
+        tracker.updateSession(session.id, { status: "revoked" }).catch(() => {});
+        tracker.logEvent({
+          eventType: "token_revoked",
+          description: "User disconnected via OAuth revocation",
+          ipAddress: req.ip,
+          userAgent: req.headers["user-agent"],
+        });
+      }
+    })
+    .catch(() => {});
+
+  // RFC 7009: always return 200, even if token is invalid
+  res.status(200).json({});
 });
 
 function buildUrl(base: string, params: Record<string, string | undefined>): string {
