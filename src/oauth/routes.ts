@@ -1,10 +1,14 @@
 import { Router } from "express";
+import { randomUUID } from "crypto";
 import axios from "axios";
 import { renderLoginPage } from "./login-page.js";
 import { createCode, redeemCode } from "./store.js";
 
 const GOC_API_URL = process.env.GOC_API_URL!;
 const MCP_BASE_URL = process.env.MCP_BASE_URL!;
+
+// In-memory registered clients (dynamic client registration - RFC 7591)
+const registeredClients = new Map<string, { redirect_uris: string[] }>();
 
 export const oauthRouter = Router();
 
@@ -13,10 +17,34 @@ oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
     issuer: MCP_BASE_URL,
     authorization_endpoint: `${MCP_BASE_URL}/oauth/authorize`,
     token_endpoint: `${MCP_BASE_URL}/oauth/token`,
+    registration_endpoint: `${MCP_BASE_URL}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code"],
     code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
     scopes_supported: ["read"],
+  });
+});
+
+// Dynamic Client Registration (RFC 7591)
+oauthRouter.post("/oauth/register", (req, res) => {
+  const { redirect_uris, client_name, token_endpoint_auth_method } = req.body as Record<string, unknown>;
+
+  if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+    res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris required" });
+    return;
+  }
+
+  const client_id = randomUUID();
+  registeredClients.set(client_id, { redirect_uris: redirect_uris as string[] });
+
+  res.status(201).json({
+    client_id,
+    client_name: client_name ?? "MCP Client",
+    redirect_uris,
+    token_endpoint_auth_method: token_endpoint_auth_method ?? "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
   });
 });
 
