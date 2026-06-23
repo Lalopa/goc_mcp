@@ -225,7 +225,7 @@ oauthRouter.post("/oauth/token", async (req, res) => {
       });
 
       // Update the session in the DB
-      newApiClient.patch(`/api/v2/mcp/sessions/${session.id}`, {
+      newApiClient.patch(`/mcp/sessions/${session.id}`, {
         mcpRefreshToken: newMcpRefreshToken,
         gocRefreshToken: newGocRefresh,
         status: "active",

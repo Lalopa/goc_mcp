@@ -1,6 +1,6 @@
 import { GocApiClient, ApiCallRecord } from "./api-client.js";
 
-const API_PREFIX = "/api/v2/mcp";
+const API_PREFIX = "/mcp";
 
 interface SessionResponse {
   success: boolean;
