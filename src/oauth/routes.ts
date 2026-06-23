@@ -12,6 +12,17 @@ const ACCESS_TOKEN_TTL_SECONDS = 7200; // 2h — matches GOC API JWT expiry
 
 export const oauthRouter = Router();
 
+// Protected Resource Metadata (RFC 9728) — tells Claude where to authenticate.
+// Required by the modern MCP authorization spec so the client can re-auth on 401.
+oauthRouter.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
+    resource: MCP_BASE_URL,
+    authorization_servers: [MCP_BASE_URL],
+    scopes_supported: ["read"],
+    bearer_methods_supported: ["header"],
+  });
+});
+
 oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
   res.json({
     issuer: MCP_BASE_URL,
