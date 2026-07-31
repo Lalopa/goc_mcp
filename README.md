@@ -53,7 +53,7 @@ Cliente MCP (Claude Code / Claude.ai)
 ### Pedidos
 | Herramienta | Descripción |
 |---|---|
-| `order_detail` | Detalle completo de un pedido por ID |
+| `order_detail` | Detalle completo de un pedido por ID: materiales, código de entrega, comentarios, documentos y cantidades reales |
 | `orders_list` | Listar pedidos con filtros (obra, estatus) |
 | `kanban_cards` | Vista kanban de pedidos agrupados por estatus y proveedor |
 

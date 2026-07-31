@@ -11,14 +11,19 @@ export function registerOrderTools(server: McpServer, client: GocApiClient, trac
     "order_detail",
     {
       title: "Order Detail",
-      description: "Get full details of an order: materials, status, provider, project, comments, and change history.",
+      description:
+        "Get full details of an order: materials, status, provider, project, and change history. " +
+        "Includes the active delivery code (if the user is authorized to see it), order and material " +
+        "comments, attached documents (with download URL), and real quantities per material " +
+        "(requested/delivered/pending, plus the material's current stage) reflecting what a driver has " +
+        "actually delivered so far — not just what the provider has made available.",
       annotations: ANNOTATIONS,
       inputSchema: {
         id: z.string().describe("Order ID"),
       },
     },
     withTracking("order_detail", client, tracker, async ({ id }) => {
-      const data = await client.get(`/orders/${id}`);
+      const data = await client.get(`/orders/${id}/mcp-detail`);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     })
   );
