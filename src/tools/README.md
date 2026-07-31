@@ -128,10 +128,15 @@ Conecta con los endpoints `/orders` y `/kanban` de `goc_api`.
 
 Detalle completo de un pedido de materiales.
 
-- **Endpoint:** `GET /orders/:id`
+- **Endpoint:** `GET /orders/:id/mcp-detail`
 - **Parámetros:** `id: string` (requerido)
-- **Retorna:** materiales solicitados (nombre, cantidad, unidad), estatus de cada material, proveedor asignado, obra destino, comentarios, imágenes de entrega, historial de cambios
-- **Uso típico:** "¿Cómo va el pedido 450?", "¿Ya llegaron los materiales del pedido 33?"
+- **Retorna:** materiales solicitados (nombre, cantidad, unidad), estatus de cada material, proveedor asignado, obra destino, historial de cambios, y además:
+  - `order.deliveryCode` — código de entrega activo, solo si el usuario tiene permiso para verlo (se omite si no)
+  - `comments` — comentarios de la card del pedido (generales y de código)
+  - `materials[].comments` — conversación de cada material (comentarios propios + eventos de código)
+  - `documents` — documentos/adjuntos del pedido con URL de descarga
+  - `materials[].quantity` — cantidades reales corregidas: `requested`, `delivered` (ya entregado, no lo disponible en proveedor), `pending`, `status` (etapa del material)
+- **Uso típico:** "¿Cómo va el pedido 450?", "¿Ya llegaron los materiales del pedido 33?", "¿Cuál es el código de entrega del pedido 7150?", "¿Qué comentarios tiene el pedido X?"
 
 ### `orders_list`
 
