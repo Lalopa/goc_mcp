@@ -53,7 +53,7 @@ export function registerEmployeeTools(server: McpServer, client: GocApiClient, t
       },
     },
     withTracking("employee_list", client, tracker, async (params) => {
-      const data = await client.get("/employees", params);
+      const data = await client.get("/employees/paginated", params);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     })
   );
