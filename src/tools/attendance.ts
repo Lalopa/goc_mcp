@@ -119,4 +119,44 @@ export function registerAttendanceTools(server: McpServer, client: GocApiClient,
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     })
   );
+
+  server.registerTool(
+    "attendance_errors",
+    {
+      title: "Attendance Errors",
+      description: "List failed (or other status) attendance registration/verification attempts (REGISTER, VERIFY, QR_GENERATED, QR_READ). Includes the error message, employee, project, attempt count, confidence score, device/IP/location metadata, and the photos captured during the attempt (S3 URLs) when available. Use this to diagnose why an employee couldn't register or verify attendance.",
+      annotations: ANNOTATIONS,
+      inputSchema: {
+        employee_id: z.string().optional().describe("Filter by employee ID"),
+        project_id: z.string().optional().describe("Filter by project ID"),
+        action_type: z
+          .enum(["REGISTER", "VERIFY", "QR_GENERATED", "QR_READ"])
+          .optional()
+          .describe("Filter by action type"),
+        status: z
+          .enum(["SUCCESS", "FAILED", "PENDING"])
+          .optional()
+          .describe("Filter by status (default FAILED)"),
+        from: z.string().optional().describe("Start date in YYYY-MM-DD format"),
+        to: z.string().optional().describe("End date in YYYY-MM-DD format"),
+        page: z.number().optional().describe("Page number (default 1)"),
+        limit: z.number().optional().describe("Results per page"),
+      },
+    },
+    withTracking("attendance_errors", client, tracker, async (params) => {
+      const query: Record<string, string | number> = {};
+      if (params.employee_id) query.employeeId = params.employee_id;
+      if (params.project_id) query.projectId = params.project_id;
+      if (params.action_type) query.actionType = params.action_type;
+      if (params.status) query.status = params.status;
+      if (params.from) query.from = params.from;
+      if (params.to) query.to = params.to;
+      const limit = params.limit ?? 50;
+      const page = params.page ?? 1;
+      query.limit = limit;
+      query.offset = (page - 1) * limit;
+      const data = await client.get("/face-recognition/attendance/errors", query);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    })
+  );
 }
