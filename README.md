@@ -4,7 +4,7 @@ Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para el
 
 ## ¿Qué es esto?
 
-Este servidor expone 14 herramientas de solo lectura que Claude puede usar para responder preguntas como:
+Este servidor expone 15 herramientas de solo lectura que Claude puede usar para responder preguntas como:
 
 - "¿Cuántas asistencias tuvo Juan García este mes?"
 - "¿Cómo va el pedido #450?"
@@ -49,6 +49,7 @@ Cliente MCP (Claude Code / Claude.ai)
 | `attendance_summary` | Resumen por proyecto y día |
 | `attendance_today` | Asistencias del día actual en tiempo real |
 | `attendance_stats` | Estadísticas generales de asistencia |
+| `attendance_errors` | Intentos fallidos de registro/verificación (REGISTER, VERIFY, QR_GENERATED, QR_READ) con mensaje de error, fotos capturadas y metadata (dispositivo, IP, ubicación), para diagnosticar por qué un empleado no logró marcar asistencia |
 
 ### Pedidos
 | Herramienta | Descripción |
