@@ -4,7 +4,7 @@ Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para el
 
 ## ¿Qué es esto?
 
-Este servidor expone 15 herramientas de solo lectura que Claude puede usar para responder preguntas como:
+Este servidor expone herramientas de consulta y administración que Claude puede usar para responder preguntas como:
 
 - "¿Cuántas asistencias tuvo Juan García este mes?"
 - "¿Cómo va el pedido #450?"
@@ -30,7 +30,7 @@ Cliente MCP (Claude Code / Claude.ai)
 **Transporte:** HTTP Streamable (especificación MCP 2025)  
 **Autenticación:** OAuth 2.0 Authorization Code Flow  
 **Modo:** Stateless — cada request es independiente  
-**Acceso:** Solo lectura (únicamente endpoints GET de goc_api)
+**Acceso:** Exclusivo para administradores activos. Consultas y edición de permisos mediante la API GOC.
 
 ## Herramientas disponibles
 
@@ -65,7 +65,51 @@ Cliente MCP (Claude Code / Claude.ai)
 | `project_detail` | Información detallada de una obra |
 | `project_employees` | Empleados asignados a una obra |
 
+### Permisos — solo administradores
+| Herramienta | Descripción |
+|---|---|
+| `permissions_view` | Consultar catálogo de módulos, permisos generales por rol/usuarios y asignaciones por obra |
+| `permissions_edit` | Modificar parcialmente permisos generales de un rol o asignar, cambiar y revocar permisos por obra |
+
+Ejemplos de argumentos:
+
+```json
+{"query":{"scope":"modules","page":1,"limit":25}}
+```
+```json
+{"query":{"scope":"roles","userIds":[7,8],"moduleIds":[10],"action":"edit"}}
+```
+```json
+{"query":{"scope":"users","moduleIds":[10],"action":"edit","page":1,"limit":25}}
+```
+```json
+{"query":{"scope":"project","projectModule":"tools","projectId":12,"roleIds":[3]}}
+```
+```json
+{"edit":{"scope":"roles","roleId":3,"permissions":[{"moduleId":10,"edit":true}]}}
+```
+```json
+{"edit":{"scope":"project","projectId":12,"projectModule":"tools","userIds":[7,8],"permissionType":"edit"}}
+```
+```json
+{"edit":{"scope":"project","projectId":12,"projectModule":"orders","roleIds":[3],"permissionType":null}}
+```
+
+- Los IDs son ejemplos: consultar primero los valores reales. Las respuestas paginadas incluyen `hasMore`.
+- Los cambios generales de un rol afectan a todos sus usuarios. Las acciones y módulos omitidos se conservan.
+- Las acciones no admitidas por un módulo se desactivan; se aplican las dependencias de lectura/escritura y estados de la web. El resultado incluye valores anteriores y finales.
+- Los ámbitos por obra existentes son `orders`, `tools` y `employees`; los niveles son `read` y `edit`. `null` revoca la asignación.
+- Al seleccionar roles para una obra se resuelven sus usuarios actuales; no se crea herencia para usuarios futuros. Se omiten usuarios inactivos al asignar, pero se permite revocarles acceso. Máximo 500 destinatarios por edición.
+- Retirar permisos de empleados conserva las relaciones de la obra. Retirar una asignación no elimina los accesos especiales de administrador ni otros permisos generales.
+- Las ediciones se ejecutan en transacciones serializables. Ante un conflicto concurrente o fallo, consultar nuevamente el estado antes de reintentar.
+
+### Despliegue y base de datos
+
+Desplegar primero el backend y después el MCP. Esta funcionalidad reutiliza las tablas existentes y no necesita migraciones ni registros iniciales. No se realizan cambios manuales en producción. Cualquier cambio futuro de esquema o datos iniciales debe versionarse mediante migraciones y ejecutarse por el pipeline al hacer merge a `main`. Las asignaciones solicitadas por administradores son operaciones funcionales de la API, no migraciones por cada edición.
+
 ## Flujo de autenticación
+
+El backend verifica firma y expiración del JWT y consulta el rol y estado **actuales** del usuario. El MCP comprueba acceso administrativo al iniciar sesión, intercambiar códigos, renovar tokens y en cada petición a `/mcp`, antes de exponer herramientas. Las herramientas de permisos y sus endpoints también exigen esta validación. Un cambio de rol o desactivación impide las peticiones posteriores aunque el JWT no haya vencido.
 
 El servidor implementa OAuth 2.0 Authorization Code Flow. Los clientes MCP compatibles (Claude Code, Claude.ai) abren el browser automáticamente al primer uso.
 
@@ -82,7 +126,8 @@ El servidor implementa OAuth 2.0 Authorization Code Flow. Los clientes MCP compa
 
 - Node.js 20+
 - `goc_api` corriendo y accesible
-- Cuenta GOC válida para autenticarse
+- Cuenta GOC activa con rol Administrador
+- Backend con `/permissions/admin-access`, `POST /permissions/query` y `PATCH /permissions/manage` desplegados
 
 ## Instalación
 

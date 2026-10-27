@@ -2,6 +2,12 @@ import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 
 const GOC_API_URL = process.env.GOC_API_URL!;
 
+export class GocApiError extends Error {
+  constructor(message: string, public readonly status: number | undefined) {
+    super(message);
+  }
+}
+
 export interface ApiCallRecord {
   method: string;
   path: string;
@@ -21,6 +27,7 @@ export class GocApiClient {
     this.http = axios.create({
       baseURL: GOC_API_URL,
       headers: { Authorization: `Bearer ${jwt}` },
+      timeout: 15000,
     });
 
     this.http.interceptors.request.use((config: TimedConfig) => {
@@ -67,14 +74,17 @@ export class GocApiClient {
     } catch (err) {
       if (axios.isAxiosError(err)) {
         const status = err.response?.status;
-        if (status === 401 || status === 403) {
-          throw new Error("Invalid token or insufficient permissions. Please re-authenticate.");
-        }
         const msg = err.response?.data?.message ?? err.response?.data?.error ?? err.message;
-        throw new Error(`goc_api error ${status}: ${msg}`);
+        throw new GocApiError(`goc_api error ${status}: ${msg}`, status);
       }
       throw err;
     }
+  }
+
+  async assertAdministrator(): Promise<void> {
+    // La API verifica firma, expiración y rol/estado vigentes en base de datos.
+    const result = await this.get<{ administrator: boolean }>("/permissions/admin-access");
+    if (result.administrator !== true) throw new GocApiError("Administrator access required", 403);
   }
 
   async post<T = unknown>(path: string, data?: unknown): Promise<T> {

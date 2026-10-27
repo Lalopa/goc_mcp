@@ -3,7 +3,7 @@ import axios from "axios";
 import { renderLoginPage } from "./login-page.js";
 import { createCode, redeemCode, generateRefreshToken } from "./store.js";
 import { registerOAuthClientInApi, getClientTrackingMetadata } from "./client-registry.js";
-import { GocApiClient } from "../api-client.js";
+import { GocApiClient, GocApiError } from "../api-client.js";
 import { McpTracker } from "../tracker.js";
 
 const GOC_API_URL = process.env.GOC_API_URL!;
@@ -19,7 +19,7 @@ oauthRouter.get("/.well-known/oauth-protected-resource", (_req, res) => {
   res.json({
     resource: MCP_BASE_URL,
     authorization_servers: [MCP_BASE_URL],
-    scopes_supported: ["read"],
+    scopes_supported: ["read", "permissions:write"],
     bearer_methods_supported: ["header"],
   });
 });
@@ -36,7 +36,7 @@ oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
     revocation_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["read"],
+    scopes_supported: ["read", "permissions:write"],
   });
 });
 
@@ -110,6 +110,7 @@ oauthRouter.post("/oauth/login-action", async (req, res) => {
       return;
     }
 
+    await new GocApiClient(jwt).assertAdministrator();
     const code = createCode(jwt, gocRefreshToken, redirect_uri);
     const callbackUrl = buildUrl(redirect_uri, { code, state });
     res.redirect(callbackUrl);
@@ -145,6 +146,14 @@ oauthRouter.post("/oauth/token", async (req, res) => {
     const result = redeemCode(code, redirect_uri);
     if (!result) {
       res.status(400).json({ error: "invalid_grant", error_description: "Code expired or invalid" });
+      return;
+    }
+
+    try {
+      await new GocApiClient(result.jwt).assertAdministrator();
+    } catch (error) {
+      const denied = error instanceof GocApiError && (error.status === 401 || error.status === 403);
+      res.status(denied ? 400 : 503).json({ error: denied ? "invalid_grant" : "temporarily_unavailable", error_description: "Active administrator access could not be verified" });
       return;
     }
 
@@ -245,6 +254,7 @@ oauthRouter.post("/oauth/token", async (req, res) => {
 
       // Update session with new tokens
       const newApiClient = new GocApiClient(newJwt);
+      await newApiClient.assertAdministrator();
       const newTracker = new McpTracker(newApiClient);
       newTracker.bindSession(session.id);
       newTracker.setRequestContext({

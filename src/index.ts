@@ -3,7 +3,7 @@ import express, { Request, Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { oauthRouter } from "./oauth/routes.js";
 import { createMcpServer } from "./mcp-server.js";
-import { GocApiClient } from "./api-client.js";
+import { GocApiClient, GocApiError } from "./api-client.js";
 import { McpTracker } from "./tracker.js";
 import { extractMcpRequestId } from "./tracking-context.js";
 
@@ -64,6 +64,19 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 
   const client = new GocApiClient(jwt);
+  try {
+    await client.assertAdministrator();
+  } catch (error) {
+    if (error instanceof GocApiError && error.status === 401) {
+      sendUnauthorized(res, "Invalid token. Please re-authenticate.");
+    } else {
+      const forbidden = error instanceof GocApiError && error.status === 403;
+      res.status(forbidden ? 403 : 503).json({
+        jsonrpc: "2.0", error: { code: -32001, message: forbidden ? "Only active administrators can access this MCP." : "Unable to verify administrator access." }, id: null,
+      });
+    }
+    return;
+  }
   const tracker = new McpTracker(client);
   tracker.setRequestContext({
     ipAddress: req.ip,
