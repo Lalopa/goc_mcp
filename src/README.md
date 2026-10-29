@@ -17,7 +17,7 @@ Arranca el servidor HTTP Express y monta todas las rutas.
 **Flujo del endpoint `/mcp`:**
 1. Extrae el `Bearer <jwt>` del header `Authorization`
 2. Si no hay token → responde `401 Unauthorized`
-3. Crea una nueva instancia del MCP server con el JWT del usuario
+3. Verifica con `/permissions/admin-access` que el JWT corresponde a un administrador activo; devuelve 401/403 o 503 si no puede verificarlo. Solo entonces crea el MCP server
 4. Crea un `StreamableHTTPServerTransport` en modo stateless (`sessionIdGenerator: undefined`)
 5. Conecta servidor y transporte
 6. Delega el request al transporte
@@ -39,7 +39,7 @@ new GocApiClient(jwt: string)
 
 - Recibe el JWT del usuario en el constructor
 - Crea una instancia de `axios` con `baseURL = GOC_API_URL` y `Authorization: Bearer <jwt>`
-- Expone un único método `get(path, params?)` para llamadas GET
+- Expone `get`, `post` y `patch`, y `assertAdministrator()` para validar acceso vigente mediante la API
 
 **Manejo de errores:**
 - `401 / 403` → lanza error con mensaje descriptivo para re-autenticación
@@ -52,15 +52,16 @@ new GocApiClient(jwt: string)
 
 Crea y configura una instancia de `McpServer` con todas las herramientas registradas.
 
-**Función `createMcpServer(jwt: string): McpServer`:**
+**Función `createMcpServer(client: GocApiClient, tracker: McpTracker): McpServer`:**
 
 1. Instancia `new McpServer({ name: "goc", version: "1.0.0" })`
-2. Crea un `GocApiClient` con el JWT recibido
+2. Recibe el cliente autenticado y el tracker de la petición
 3. Registra todas las herramientas por dominio:
    - `registerEmployeeTools(server, client)`
    - `registerAttendanceTools(server, client)`
    - `registerOrderTools(server, client)`
    - `registerProjectTools(server, client)`
+   - `registerPermissionTools(server, client, tracker)` — consulta y edición administrativa de permisos
 4. Retorna el servidor listo para conectar a un transporte
 
 Cada llamada a `createMcpServer()` produce una instancia independiente y aislada. No hay estado compartido entre requests.

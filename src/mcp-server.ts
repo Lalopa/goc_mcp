@@ -5,6 +5,7 @@ import { registerEmployeeTools } from "./tools/employees.js";
 import { registerAttendanceTools } from "./tools/attendance.js";
 import { registerOrderTools } from "./tools/orders.js";
 import { registerProjectTools } from "./tools/projects.js";
+import { registerPermissionTools } from "./tools/permissions.js";
 
 export function createMcpServer(client: GocApiClient, tracker: McpTracker): McpServer {
   const server = new McpServer({
@@ -16,6 +17,7 @@ export function createMcpServer(client: GocApiClient, tracker: McpTracker): McpS
   registerAttendanceTools(server, client, tracker);
   registerOrderTools(server, client, tracker);
   registerProjectTools(server, client, tracker);
+  registerPermissionTools(server, client, tracker);
 
   return server;
 }
