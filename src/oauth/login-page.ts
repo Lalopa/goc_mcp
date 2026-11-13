@@ -27,10 +27,10 @@ function errorText(code: string): string {
   return Object.hasOwn(LOGIN_ERROR_TEXTS, code) ? LOGIN_ERROR_TEXTS[code as LoginErrorCode] : GENERIC_LOGIN_ERROR_TEXT;
 }
 
-// Cualquiera puede registrar un cliente: sin caracteres de control ni de formato (incluidos los de
-// dirección de texto, como U+202E), recortado, y aislado con <bdi> para que no reordene lo que lo rodea.
+// Cualquiera puede registrar un cliente: sin caracteres de control, de formato (incluidos los de
+// dirección de texto, como U+202E) ni marcas combinantes (texto «Zalgo» que se apila en vertical), recortado, y aislado con <bdi> para que no reordene lo que lo rodea.
 function displayName(name: string): string {
-  const clean = name.replace(/[\p{Cc}\p{Cf}]/gu, "").trim();
+  const clean = name.replace(/[\p{Cc}\p{Cf}\p{M}]/gu, "").trim();
   const chars = Array.from(clean);
   return chars.length > MAX_DISPLAY_NAME_LENGTH ? `${chars.slice(0, MAX_DISPLAY_NAME_LENGTH).join("")}…` : clean;
 }
@@ -48,7 +48,7 @@ export function renderLoginPage(params: LoginPageParams): string {
   const host = hostOf(redirect_uri);
   // El destino va primero y en su propia línea: es lo único que no controla quien se registró.
   const returnsTo = host ? `<p class="client">Returns to <strong>${escapeHtml(host)}</strong></p>` : "";
-  const connecting = `<p class="client">Application: <bdi>${escapeHtml(displayName(client_name) || "Unnamed client")}</bdi></p>`;
+  const connecting = `<p class="client app-name">Application: <bdi>${escapeHtml(displayName(client_name) || "Unnamed client")}</bdi></p>`;
 
   const errorBlock = error
     ? `<p class="error">${escapeHtml(errorText(error))}</p>`
@@ -125,6 +125,11 @@ export function renderLoginPage(params: LoginPageParams): string {
       color: #444;
       margin-bottom: 16px;
       word-break: break-word;
+    }
+    .app-name {
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
     }
     .error {
       background: #fff0f0;

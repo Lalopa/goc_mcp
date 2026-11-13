@@ -357,7 +357,10 @@ export function createOauthRouter(deps: OauthDeps): Router {
 
       const login = await api.login(username, password);
       if (!login.ok) {
-        fail("invalid_credentials", "login rechazado");
+        fail(
+          login.kind === "rejected" ? "invalid_credentials" : "unavailable",
+          `login ${login.kind === "rejected" ? "rechazado" : "no disponible"} status=${login.status ?? "n/a"}`
+        );
         return;
       }
 

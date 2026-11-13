@@ -743,3 +743,64 @@ test("createDefaultDeps: findClient consulta /mcp/clients/<id codificado> y devu
     axios.defaults.adapter = original;
   }
 });
+
+// ---------------- login: rechazo frente a indisponibilidad ----------------
+
+test("login-action: solo 400/401 de la API son credenciales incorrectas; todo lo demás es unavailable, sin administrador ni código", async () => {
+  const noToken = { status: 200, data: { refreshToken: "r" } };
+  const noRefresh = { status: 200, data: { token: "j" } };
+  const cases: Array<[string, any, string]> = [
+    ["401", { status: 401, data: { message: "no" } }, "invalid_credentials"],
+    ["400", { status: 400, data: {} }, "invalid_credentials"],
+    ["500", { status: 500, data: {} }, "unavailable"],
+    ["503", { status: 503, data: {} }, "unavailable"],
+    ["429", { status: 429, data: {} }, "unavailable"],
+    ["404", { status: 404, data: {} }, "unavailable"],
+    ["timeout", new Error("timeout"), "unavailable"],
+    ["2xx sin token", noToken, "unavailable"],
+    ["2xx sin refreshToken", noRefresh, "unavailable"],
+  ];
+  for (const [label, response, code] of cases) {
+    const f = fakeHttp({ "POST /auth/login": response });
+    const { router } = buildRouter(f.http);
+    const before = pendingCodeCount();
+    const res = await post(router, loginBody());
+    assert.equal(new URL(`http://x${res.redirectedTo}`).searchParams.get("error"), code, label);
+    assert.equal(f.callsTo("/permissions/admin-access").length, 0, `${label}: sin comprobar administrador`);
+    assert.equal(pendingCodeCount(), before, `${label}: sin código`);
+  }
+});
+
+test("login: el mensaje de la API no llega a la página ni al log", async () => {
+  const f = fakeHttp({ "POST /auth/login": { status: 500, data: { message: "mensaje-interno-sentinel" } } });
+  const { router, logs } = buildRouter(f.http);
+  const res = await post(router, loginBody());
+  const page = html(await runRoute(router, "get", "/oauth/authorize", {
+    ...fakeReq({}), query: Object.fromEntries(new URL(`http://x${res.redirectedTo}`).searchParams),
+  }));
+  assert.equal(`${page}${logs.join("\n")}`.includes("mensaje-interno-sentinel"), false);
+  assert.ok(page.includes(LOGIN_ERROR_TEXTS.unavailable));
+});
+
+// ---------------- login page: Zalgo y espacios ----------------
+
+test("login page: las marcas combinantes (Zalgo) se quitan del nombre mostrado", async () => {
+  const zalgo = `A${"̀́̂̃҉".repeat(40)}BC`;
+  const { router } = buildRouter(fakeHttp().http, clientNamed(zalgo));
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.ok(page.includes("<bdi>ABC</bdi>"));
+  assert.equal(/\p{M}/u.test(page), false);
+});
+
+test("login page: el contenedor del nombre recorta el desbordamiento en una línea", async () => {
+  const { router } = buildRouter(fakeHttp().http);
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.match(page, /\.app-name \{[^}]*overflow: hidden;[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis;/);
+  assert.ok(page.includes('class="client app-name"'));
+});
+
+test("login page: los espacios alrededor del nombre se recortan", async () => {
+  const { router } = buildRouter(fakeHttp().http, clientNamed("  Nombre  "));
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.ok(page.includes("<bdi>Nombre</bdi>"));
+});

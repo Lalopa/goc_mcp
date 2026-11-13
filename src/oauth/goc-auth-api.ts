@@ -29,7 +29,8 @@ export interface SessionPair {
 
 export type LoginResult =
   | { ok: true; jwt: string; gocRefreshToken: string }
-  | { ok: false; message: string };
+  // Sin mensaje de la API: nunca llega a logs ni a la página.
+  | { ok: false; kind: "rejected" | "unavailable"; status?: number };
 
 export interface RequestCaller {
   ipAddress?: string;
@@ -113,19 +114,17 @@ export function createGocAuthApi(
     async login(username, password) {
       try {
         const res = await http.post("/auth/login", { username, password }, { timeoutMs: LOGIN_TIMEOUT_MS });
-        if (res.status < 200 || res.status >= 300) {
-          const message = str(field(res.data, "message")) ?? str(field(res.data, "error")) ?? "Invalid credentials";
-          return { ok: false, message };
-        }
+        // Solo 400/401 son «credenciales incorrectas»; 5xx, 429, 404… no dicen nada de la contraseña.
+        if (res.status !== 200 && res.status !== 201) return failure(res.status, [400, 401]);
         const data = res.data;
         const inner = field(data, "data");
         const jwt = str(field(data, "token")) ?? str(field(inner, "accessToken")) ?? str(field(data, "accessToken"));
-        if (!jwt) return { ok: false, message: "No token received" };
+        if (!jwt) return { ok: false, kind: "unavailable", status: res.status };
         const gocRefreshToken = str(field(data, "refreshToken")) ?? str(field(inner, "refreshToken"));
-        if (!gocRefreshToken) return { ok: false, message: "No refresh token received" };
+        if (!gocRefreshToken) return { ok: false, kind: "unavailable", status: res.status };
         return { ok: true, jwt, gocRefreshToken };
       } catch {
-        return { ok: false, message: "Authentication service unavailable" };
+        return { ok: false, kind: "unavailable" };
       }
     },
 
