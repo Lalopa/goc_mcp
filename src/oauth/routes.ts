@@ -4,6 +4,7 @@ import { renderLoginPage } from "./login-page.js";
 import { createCode, redeemCode } from "./store.js";
 import type { GocAuthApi } from "./goc-auth-api.js";
 import { secondsUntilExpiry } from "./jwt.js";
+import { TEMPORARILY_UNAVAILABLE, noStore, oauthError, unavailable } from "./responses.js";
 import {
   LOGIN_RATE_LIMIT,
   REVOKE_RATE_LIMIT,
@@ -26,32 +27,26 @@ export interface OauthDeps {
   }): Promise<void>;
   /** Solo recibe mensajes sin tokens ni datos del usuario. */
   log?: (message: string) => void;
+  /** Configuración que requiere atención del operador (p. ej. API sin los endpoints nuevos). */
+  logError?: (message: string) => void;
   limits?: { token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig };
 }
-
-const TEMPORARILY_UNAVAILABLE = "temporarily_unavailable";
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
-function noStore(res: Response): void {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Pragma", "no-cache");
-}
-
-function oauthError(res: Response, status: number, error: string, description: string): void {
-  noStore(res);
-  res.status(status).json({ error, error_description: description });
-}
-
-function unavailable(res: Response): void {
-  oauthError(res, 503, TEMPORARILY_UNAVAILABLE, "Authorization service temporarily unavailable");
-}
+export const REFRESH_ENDPOINT_MISSING_MESSAGE =
+  "oauth refresh: la API respondió 404 en el endpoint de renovación; la API no expone el endpoint " +
+  "(API sin desplegar o GOC_API_URL mal configurada)";
+export const REVOKE_ENDPOINT_MISSING_MESSAGE =
+  "oauth revoke: la API respondió 404 en el endpoint de revocación; la API no expone el endpoint " +
+  "(API sin desplegar o GOC_API_URL mal configurada)";
 
 export function createOauthRouter(deps: OauthDeps): Router {
   const { api, mcpBaseUrl } = deps;
   const log = deps.log ?? ((message: string) => console.warn(message));
+  const logError = deps.logError ?? ((message: string) => console.error(message));
   const router = Router();
 
   const tokenLimit = rateLimitMiddleware(
@@ -247,7 +242,8 @@ export function createOauthRouter(deps: OauthDeps): Router {
         return;
       }
 
-      const clientMeta = await deps.getClientMeta(clientId);
+      // Con el código ya quemado, un fallo al resolver el nombre del cliente no debe tumbar el canje.
+      const clientMeta = await deps.getClientMeta(clientId).catch((): Record<string, string> => ({ client_id: clientId }));
       const session = await api.createSession(result.jwt, {
         gocRefreshToken: result.gocRefreshToken,
         clientId,
@@ -293,7 +289,8 @@ export function createOauthRouter(deps: OauthDeps): Router {
       // Sin encabezado Authorization: la credencial es el refresh token del cuerpo.
       const refreshed = await api.refreshSession({ refreshToken, clientId, ...caller });
       if (!refreshed.ok) {
-        log(`oauth refresh ${refreshed.kind} status=${refreshed.status ?? "n/a"}`);
+        if (refreshed.status === 404) logError(REFRESH_ENDPOINT_MISSING_MESSAGE);
+        else log(`oauth refresh ${refreshed.kind} status=${refreshed.status ?? "n/a"}`);
         if (refreshed.kind === "rejected") {
           oauthError(res, 400, "invalid_grant", "Refresh token invalid or expired");
         } else {
@@ -323,7 +320,10 @@ export function createOauthRouter(deps: OauthDeps): Router {
     if (token) {
       // El token va a la API tal cual (refresh token o no); la API decide y nunca lo usamos como Bearer.
       const revoked = await api.revokeSession({ token, ipAddress: req.ip, userAgent: req.headers["user-agent"] });
-      if (!revoked.ok) log(`oauth revoke ${revoked.kind} status=${revoked.status ?? "n/a"}`);
+      if (!revoked.ok) {
+        if (revoked.status === 404) logError(REVOKE_ENDPOINT_MISSING_MESSAGE);
+        else log(`oauth revoke ${revoked.kind} status=${revoked.status ?? "n/a"}`);
+      }
     }
 
     // RFC 7009: always return 200, even if token is invalid
@@ -339,7 +339,7 @@ function optionalExpiresIn(seconds: number | undefined): { expires_in?: number }
 }
 
 // Ningún camino puede devolver algo que no sea JSON OAuth: un 500 HTML o un error desconocido haría que
-// el cliente abra un login nuevo; temporarily_unavailable conserva sus credenciales.
+// el cliente abra un login nuevo; con temporarily_unavailable el cliente no descarta sus credenciales.
 function guardJson(
   log: (message: string) => void,
   handler: (req: Request, res: Response) => Promise<void>,

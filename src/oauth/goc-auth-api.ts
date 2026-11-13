@@ -1,4 +1,5 @@
 import axios from "axios";
+import type { AxiosAdapter } from "axios";
 
 export interface HttpResponse {
   status: number;
@@ -61,8 +62,10 @@ const SESSION_TIMEOUT_MS = 10_000;
 const REVOKE_TIMEOUT_MS = 5_000;
 const LOGIN_TIMEOUT_MS = 15_000;
 
-export function createAxiosHttpClient(baseUrl: string): HttpClient {
-  const instance = axios.create({ baseURL: baseUrl, validateStatus: () => true });
+export function createAxiosHttpClient(baseUrl: string, options: { adapter?: AxiosAdapter } = {}): HttpClient {
+  // validateStatus siempre true: la clasificación rechazo/indisponible depende de recibir el status de
+  // cualquier respuesta (un 401 que lanzara se vería como indisponible y el cliente nunca abriría login).
+  const instance = axios.create({ baseURL: baseUrl, validateStatus: () => true, adapter: options.adapter });
   return {
     async get(url, options) {
       const res = await instance.get(url, { headers: options?.headers, timeout: options?.timeoutMs });
@@ -84,7 +87,9 @@ function field(data: unknown, name: string): unknown {
 }
 
 // Rechazo definitivo solo para los status indicados; todo lo demás (429, 5xx, 404 por API sin desplegar…)
-// es indisponibilidad transitoria y nunca debe hacer descartar credenciales válidas.
+// es indisponibilidad transitoria: se responde 503 temporarily_unavailable y el cliente OAuth no descarta
+// sus credenciales. Si la API llegó a rotar el refresh token y la respuesta se perdió, un reintento tardío
+// (pasada la ventana de gracia de la API) puede acabar en un login nuevo.
 function failure(status: number, rejectedStatuses: number[]): { ok: false; kind: "rejected" | "unavailable"; status: number } {
   return { ok: false, kind: rejectedStatuses.includes(status) ? "rejected" : "unavailable", status };
 }

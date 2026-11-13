@@ -3,17 +3,22 @@ import express, { Request, Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createOauthRouter } from "./oauth/routes.js";
 import { createDefaultDeps } from "./oauth/deps.js";
+import { createOauthErrorHandler } from "./oauth/error-handler.js";
+import { configureTrustProxy } from "./oauth/trust-proxy.js";
 import { createMcpServer } from "./mcp-server.js";
 import { GocApiClient, GocApiError } from "./api-client.js";
 import { McpTracker } from "./tracker.js";
 import { extractMcpRequestId } from "./tracking-context.js";
 
 const app = express();
-app.set("trust proxy", true);
+// Saltos de proxy de confianza (TRUST_PROXY_HOPS, por defecto 1: nginx delante). De esto depende req.ip.
+configureTrustProxy(app, process.env.TRUST_PROXY_HOPS);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use(createOauthRouter(createDefaultDeps()));
+// Errores de los parsers de arriba en /oauth/*: JSON OAuth en vez del HTML de finalhandler.
+app.use(createOauthErrorHandler());
 
 const MCP_BASE_URL = process.env.MCP_BASE_URL!;
 const RESOURCE_METADATA_URL = `${MCP_BASE_URL}/.well-known/oauth-protected-resource`;
