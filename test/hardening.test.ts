@@ -365,7 +365,7 @@ test("login-action: administrador rechazado (403 o administrator:false) vuelve a
     const before = pendingCodeCount();
     const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p" })));
     assert.ok(res.redirectedTo!.startsWith("/oauth/authorize?"));
-    assert.equal(errorParam(res.redirectedTo), "Administrator access required");
+    assert.equal(errorParam(res.redirectedTo), "admin_required");
     assert.equal(pendingCodeCount(), before);
   }
 });
@@ -375,7 +375,7 @@ test("login-action: API no disponible al verificar al administrador vuelve al lo
     const { router } = buildRouter(fakeHttp({ "GET /permissions/admin-access": response }).http);
     const before = pendingCodeCount();
     const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p" })));
-    assert.equal(errorParam(res.redirectedTo), "Service temporarily unavailable");
+    assert.equal(errorParam(res.redirectedTo), "unavailable");
     assert.equal(pendingCodeCount(), before);
   }
 });
@@ -387,4 +387,43 @@ test("canje: administrator:false al canjear da invalid_grant y no llama al alta"
   const res = await runRoute(router, "post", "/oauth/token", fakeReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: CLIENT_ID, code_verifier: VERIFIER }));
   assert.equal((res.body as any).error, "invalid_grant");
   assert.equal(f.callsTo("/mcp/sessions").length, 0);
+});
+
+// ---------------- rutas: Express no distingue mayúsculas ni barra final ----------------
+
+test("app: el manejador de errores reconoce /oauth/* con otras mayúsculas o barra final", async () => {
+  const { app } = appWith("1");
+  for (const url of ["/OAUTH/token", "/Oauth/Register", "/oauth/revoke/"]) {
+    const res = await invokeApp(app, { method: "POST", url, headers: { "content-type": "application/json" }, body: "{roto" });
+    assert.equal(res.status, 400, url);
+    assert.match(String(res.headers["content-type"]), /application\/json/, url);
+    assert.equal(JSON.parse(res.body).error, "invalid_request", url);
+  }
+  for (const url of ["/oauth/authorize/", "/OAUTH/Login-Action", "/oauth/login-action/"]) {
+    const res = await invokeApp(app, { method: "POST", url, headers: { "content-type": "application/json" }, body: "{roto" });
+    assert.equal(res.status, 400, url);
+    assert.match(String(res.headers["content-type"]), /text\/html/, url);
+    assert.equal(res.headers["x-frame-options"], "DENY", url);
+    assert.equal(res.headers["cache-control"], "no-store", url);
+  }
+});
+
+test("error handler: la normalización no captura rutas ajenas a /oauth/", () => {
+  const handler = createOauthErrorHandler(() => {});
+  for (const path of ["/MCP", "/mcp/", "/oauthx/token"]) {
+    let delegated = false;
+    handler(new Error("x"), { path } as any, fakeRes() as any, () => { delegated = true; });
+    assert.equal(delegated, true, path);
+  }
+});
+
+test("error handler: las páginas de error de /oauth/* llevan no-store y no admiten marcos", () => {
+  const handler = createOauthErrorHandler(() => {});
+  for (const err of [Object.assign(new Error("x"), { status: 400 }), new Error("boom")]) {
+    const res = fakeRes();
+    handler(err, { path: "/oauth/authorize" } as any, res as any, () => {});
+    assert.equal(res.headers["cache-control"], "no-store");
+    assert.equal(res.headers["content-security-policy"], "frame-ancestors 'none'");
+    assert.equal(res.headers["x-frame-options"], "DENY");
+  }
 });

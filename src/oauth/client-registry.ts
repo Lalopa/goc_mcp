@@ -56,7 +56,9 @@ export async function findOAuthClient(clientId: string): Promise<ClientLookup> {
       validateStatus: (status) => status === 200 || status === 404,
     });
     if (response.status === 404) return { kind: "not_found" };
-    const data = response.data?.data as { clientName?: unknown; redirectUris?: unknown } | null | undefined;
+    const data = response.data?.data as { clientId?: unknown; clientName?: unknown; redirectUris?: unknown } | null | undefined;
+    // Una respuesta de otro cliente no sirve para validar este: no se acepta.
+    if (data?.clientId !== clientId) return { kind: "unavailable" };
     const uris = data?.redirectUris;
     if (!Array.isArray(uris) || !uris.every((u) => typeof u === "string")) return { kind: "unavailable" };
     const clientName = typeof data?.clientName === "string" ? data.clientName : "";

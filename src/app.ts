@@ -29,7 +29,9 @@ function isJwtExpired(jwt: string): boolean {
   }
 }
 
-// Construye la app sin abrir un puerto ni leer el entorno al importar: src/index.ts hace `listen`.
+// Construye la app sin abrir un puerto: src/index.ts hace `listen`. TRUST_PROXY_HOPS y los valores de
+// createDefaultDeps se leen al llamar; client-registry.ts lee GOC_API_URL al cargarse, así que
+// src/index.ts importa dotenv antes que este módulo.
 export function createApp(deps: OauthDeps = createDefaultDeps(), options: AppOptions = {}): Express {
   const app = express();
   // Saltos de proxy de confianza (TRUST_PROXY_HOPS, por defecto 1: nginx delante). De esto depende req.ip.

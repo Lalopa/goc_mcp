@@ -1,15 +1,17 @@
 import { Router } from "express";
 import type { Request, RequestHandler, Response } from "express";
 import { renderLoginPage } from "./login-page.js";
-import { INVALID_REQUEST_PAGE_TEXT, UNAVAILABLE_PAGE_TEXT, renderErrorPage } from "./error-page.js";
+import type { LoginErrorCode } from "./login-page.js";
+import { INVALID_REQUEST_PAGE_TEXT, RATE_LIMITED_PAGE_TEXT, UNAVAILABLE_PAGE_TEXT, sendErrorPage } from "./error-page.js";
 import { CODE_CHALLENGE_METHOD, isValidCodeChallenge } from "./pkce.js";
 import { MAX_REDIRECT_URIS, isAllowedRedirectUri, matchesRegisteredRedirectUri } from "./redirect-uri.js";
 import type { ClientLookup } from "./client-registry.js";
 import { createCode, redeemCode } from "./store.js";
 import type { GocAuthApi } from "./goc-auth-api.js";
 import { secondsUntilExpiry } from "./jwt.js";
-import { TEMPORARILY_UNAVAILABLE, noStore, oauthError, unavailable } from "./responses.js";
+import { TEMPORARILY_UNAVAILABLE, frameGuard, noStore, oauthError, unavailable } from "./responses.js";
 import {
+  AUTHORIZE_RATE_LIMIT,
   LOGIN_RATE_LIMIT,
   REGISTER_RATE_LIMIT,
   REVOKE_RATE_LIMIT,
@@ -39,7 +41,7 @@ export interface OauthDeps {
   log?: (message: string) => void;
   /** Configuración que requiere atención del operador (p. ej. API sin los endpoints nuevos). */
   logError?: (message: string) => void;
-  limits?: { token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig; register?: RateLimitConfig };
+  limits?: { authorize?: RateLimitConfig; token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig; register?: RateLimitConfig };
 }
 
 function str(value: unknown): string | undefined {
@@ -109,12 +111,22 @@ export function createOauthRouter(deps: OauthDeps): Router {
     }
   );
 
+  const authorizeLimit = rateLimitMiddleware(
+    createRateLimiter(deps.limits?.authorize ?? AUTHORIZE_RATE_LIMIT),
+    (_req, res, retryAfter) => {
+      res.setHeader("Retry-After", String(retryAfter));
+      sendErrorPage(res, 429, RATE_LIMITED_PAGE_TEXT);
+    }
+  );
+
   // Validación compartida por authorize y login-action. Orden: cliente registrado → redirect_uri de ese
   // cliente → response_type → PKCE. Hasta que el cliente y la redirect_uri no están verificados no se
   // redirige a ningún sitio.
   async function checkAuthorization(input: AuthorizationRequest, requireResponseType: boolean): Promise<AuthorizationCheck> {
     const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = input;
     if (!client_id || client_id.length > MAX_CLIENT_FIELD_LENGTH || !redirect_uri) return { ok: false, kind: "page", status: 400 };
+    // Barato y antes de la consulta a la API: lo que la política rechaza no cuesta una llamada.
+    if (!isAllowedRedirectUri(redirect_uri)) return { ok: false, kind: "page", status: 400 };
 
     const lookup = await deps.findClient(client_id).catch((): ClientLookup => ({ kind: "unavailable" }));
     if (lookup.kind === "unavailable") {
@@ -148,12 +160,12 @@ export function createOauthRouter(deps: OauthDeps): Router {
   }
 
   const sendCheckFailure = (res: Response, check: Exclude<AuthorizationCheck, { ok: true }>) => {
-    noStore(res);
     if (check.kind === "redirect") {
+      noStore(res);
       res.redirect(check.location);
       return;
     }
-    res.status(check.status).send(renderErrorPage(check.status === 503 ? UNAVAILABLE_PAGE_TEXT : INVALID_REQUEST_PAGE_TEXT));
+    sendErrorPage(res, check.status, check.status === 503 ? UNAVAILABLE_PAGE_TEXT : INVALID_REQUEST_PAGE_TEXT);
   };
 
   const loginLimit = rateLimitMiddleware(
@@ -163,7 +175,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const redirect_uri = str(body.redirect_uri);
       if (!redirect_uri) {
-        res.status(429).send("Too many attempts");
+        sendErrorPage(res, 429, RATE_LIMITED_PAGE_TEXT);
         return;
       }
       res.redirect(
@@ -174,7 +186,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
           client_id: str(body.client_id),
           code_challenge: str(body.code_challenge),
           code_challenge_method: str(body.code_challenge_method),
-          error: "Too many attempts. Please wait a few minutes and try again.",
+          error: "too_many_attempts" satisfies LoginErrorCode,
         })
       );
     }
@@ -263,7 +275,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
     });
   });
 
-  router.get("/oauth/authorize", async (req, res) => {
+  router.get("/oauth/authorize", authorizeLimit, async (req, res) => {
     const q = req.query as Record<string, unknown>;
     const check = await checkAuthorization(
       {
@@ -282,6 +294,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
     }
 
     noStore(res);
+    frameGuard(res);
     res.send(
       renderLoginPage({
         redirect_uri: check.redirect_uri,
@@ -321,7 +334,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
       }
       const { redirect_uri, state, client_id, code_challenge, code_challenge_method } = check;
 
-      const fail = (message: string, reason: string) => {
+      const fail = (code: LoginErrorCode, reason: string) => {
         // Sin usuario, contraseña ni el mensaje de la API.
         log(`oauth login fallido: ${reason}`);
         res.redirect(
@@ -332,26 +345,26 @@ export function createOauthRouter(deps: OauthDeps): Router {
             client_id,
             code_challenge,
             code_challenge_method,
-            error: message,
+            error: code,
           })
         );
       };
 
       if (!username || !password) {
-        fail("Invalid credentials", "faltan credenciales");
+        fail("invalid_credentials", "faltan credenciales");
         return;
       }
 
       const login = await api.login(username, password);
       if (!login.ok) {
-        fail(login.message, "login rechazado");
+        fail("invalid_credentials", "login rechazado");
         return;
       }
 
       const admin = await api.assertAdministrator(login.jwt);
       if (!admin.ok) {
         fail(
-          admin.kind === "rejected" ? "Administrator access required" : "Service temporarily unavailable",
+          admin.kind === "rejected" ? "admin_required" : "unavailable",
           `verificación de administrador ${admin.kind} status=${admin.status ?? "n/a"}`
         );
         return;
@@ -362,8 +375,7 @@ export function createOauthRouter(deps: OauthDeps): Router {
       res.redirect(buildUrl(redirect_uri, { code, state }));
     } catch {
       log("oauth login fallido: error inesperado");
-      noStore(res);
-      if (!res.headersSent) res.status(503).send(renderErrorPage(UNAVAILABLE_PAGE_TEXT));
+      if (!res.headersSent) sendErrorPage(res, 503, UNAVAILABLE_PAGE_TEXT);
     }
   });
 

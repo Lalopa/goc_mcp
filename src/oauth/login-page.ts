@@ -4,9 +4,35 @@ export interface LoginPageParams {
   client_id?: string;
   code_challenge: string;
   code_challenge_method: string;
-  /** Nombre registrado del cliente (texto libre de quien se registró: siempre escapado). */
+  /** Nombre registrado del cliente (texto libre de quien se registró: se limpia y se escapa). */
   client_name?: string;
+  /** Código de `LOGIN_ERROR_TEXTS`; cualquier otro valor muestra el texto genérico. */
   error?: string;
+}
+
+// Los mensajes de error son un conjunto cerrado: `?error=` lo controla quien arma el enlace, así que
+// nunca se muestra como texto libre.
+export const LOGIN_ERROR_TEXTS = {
+  invalid_credentials: "Invalid username or password.",
+  too_many_attempts: "Too many attempts. Please wait a few minutes and try again.",
+  admin_required: "Administrator access required.",
+  unavailable: "Service temporarily unavailable. Please try again in a few minutes.",
+} as const;
+export type LoginErrorCode = keyof typeof LOGIN_ERROR_TEXTS;
+export const GENERIC_LOGIN_ERROR_TEXT = "Could not sign in. Please try again.";
+
+export const MAX_DISPLAY_NAME_LENGTH = 60;
+
+function errorText(code: string): string {
+  return Object.hasOwn(LOGIN_ERROR_TEXTS, code) ? LOGIN_ERROR_TEXTS[code as LoginErrorCode] : GENERIC_LOGIN_ERROR_TEXT;
+}
+
+// Cualquiera puede registrar un cliente: sin caracteres de control ni de formato (incluidos los de
+// dirección de texto, como U+202E), recortado, y aislado con <bdi> para que no reordene lo que lo rodea.
+function displayName(name: string): string {
+  const clean = name.replace(/[\p{Cc}\p{Cf}]/gu, "").trim();
+  const chars = Array.from(clean);
+  return chars.length > MAX_DISPLAY_NAME_LENGTH ? `${chars.slice(0, MAX_DISPLAY_NAME_LENGTH).join("")}…` : clean;
 }
 
 function hostOf(uri: string): string {
@@ -20,12 +46,12 @@ function hostOf(uri: string): string {
 export function renderLoginPage(params: LoginPageParams): string {
   const { redirect_uri, state = "", client_id = "", code_challenge, code_challenge_method, client_name = "", error } = params;
   const host = hostOf(redirect_uri);
-  const connecting = client_name || host
-    ? `<p class="client">Connecting: <strong>${escapeHtml(client_name || "Unnamed client")}</strong>${host ? ` (returns to ${escapeHtml(host)})` : ""}</p>`
-    : "";
+  // El destino va primero y en su propia línea: es lo único que no controla quien se registró.
+  const returnsTo = host ? `<p class="client">Returns to <strong>${escapeHtml(host)}</strong></p>` : "";
+  const connecting = `<p class="client">Application: <bdi>${escapeHtml(displayName(client_name) || "Unnamed client")}</bdi></p>`;
 
   const errorBlock = error
-    ? `<p class="error">${escapeHtml(error)}</p>`
+    ? `<p class="error">${escapeHtml(errorText(error))}</p>`
     : "";
 
   return `<!DOCTYPE html>
@@ -114,7 +140,8 @@ export function renderLoginPage(params: LoginPageParams): string {
 <body>
   <div class="card">
     <div class="logo">GOC</div>
-    <div class="subtitle">Sign in to connect Claude with your account</div>
+    <div class="subtitle">Sign in to connect an application with your account</div>
+    ${returnsTo}
     ${connecting}
     ${errorBlock}
     <form method="POST" action="/oauth/login-action">

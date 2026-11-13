@@ -7,6 +7,11 @@ import { isValidCodeChallenge, isValidCodeVerifier, verifyPkce } from "../src/oa
 import { isAllowedRedirectUri, matchesRegisteredRedirectUri } from "../src/oauth/redirect-uri.js";
 import { createCode, pendingCodeCount, redeemCode } from "../src/oauth/store.js";
 import { findOAuthClient } from "../src/oauth/client-registry.js";
+import { createDefaultDeps } from "../src/oauth/deps.js";
+import { createGocAuthApi } from "../src/oauth/goc-auth-api.js";
+import { GENERIC_LOGIN_ERROR_TEXT, LOGIN_ERROR_TEXTS, MAX_DISPLAY_NAME_LENGTH } from "../src/oauth/login-page.js";
+import { RATE_LIMITED_PAGE_TEXT, UNAVAILABLE_PAGE_TEXT } from "../src/oauth/error-page.js";
+import { AUTHORIZE_RATE_LIMIT } from "../src/oauth/rate-limit.js";
 import {
   CHALLENGE, CLIENT_ID, REDIRECT, SECRETS, VERIFIER, buildRouter, fakeHttp, fakeReq, loginAndGetCode, loginBody, runRoute,
 } from "./helpers.js";
@@ -543,5 +548,198 @@ test("findOAuthClient: 5xx, 429, 401, timeout, cuerpo vacío o redirectUris mal 
     { data: { clientName: "N", redirectUris: ["https://a.test/cb", 5] } }, { data: { clientName: "N", redirectUris: { 0: "x" } } },
   ]) {
     assert.deepEqual(await lookupWith(answer(200, data)), { kind: "unavailable" }, JSON.stringify(data));
+  }
+});
+
+// ---------------- página de login: no falsificable ----------------
+
+const clientNamed = (clientName: string) => ({
+  findClient: async () => ({ kind: "found" as const, clientName, redirectUris: [REDIRECT] }),
+});
+
+test("login page: muestra el host de retorno como texto visible y antes del nombre del cliente", async () => {
+  const { router } = buildRouter(fakeHttp().http);
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.ok(page.includes("Returns to <strong>claude.test</strong>"));
+  assert.ok(page.indexOf("Returns to") < page.indexOf("Test Agent"));
+});
+
+test("login page: el subtítulo no afirma que el cliente sea Claude", async () => {
+  const { router } = buildRouter(fakeHttp().http);
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.equal(/Sign in to connect Claude/.test(page), false);
+  assert.ok(page.includes("Sign in to connect an application"));
+});
+
+test("login page: el nombre del cliente pierde caracteres de control y de formato (U+202E), va en <bdi> y se recorta", async () => {
+  const name = `Safe‮evil\u0000​\n${"x".repeat(200)}`;
+  const { router } = buildRouter(fakeHttp().http, clientNamed(name));
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.equal(/[‮​\u0000]/.test(page), false);
+  const shown = /<bdi>([^<]*)<\/bdi>/.exec(page)?.[1] ?? "";
+  assert.ok(shown.startsWith("Safeevilxxx"));
+  assert.ok(Array.from(shown).length <= MAX_DISPLAY_NAME_LENGTH + 1);
+});
+
+test("login page: un nombre de cliente con HTML sale escapado dentro de <bdi>", async () => {
+  const { router } = buildRouter(fakeHttp().http, clientNamed(`<b onclick="x">hola</b>`));
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.ok(page.includes("<bdi>&lt;b onclick=&quot;x&quot;&gt;hola&lt;/b&gt;</bdi>"));
+  assert.equal(page.includes("<b onclick"), false);
+});
+
+test("login page: un nombre solo de caracteres invisibles se muestra como cliente sin nombre", async () => {
+  const { router } = buildRouter(fakeHttp().http, clientNamed("‮​"));
+  const page = html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery()));
+  assert.ok(page.includes("<bdi>Unnamed client</bdi>"));
+});
+
+test("login page: ?error= solo muestra textos fijos por código; un texto libre o un código desconocido da el genérico", async () => {
+  const { router } = buildRouter(fakeHttp().http);
+  const show = async (error: string) => html(await runRoute(router, "get", "/oauth/authorize", authorizeQuery({ error })));
+  for (const [code, text] of Object.entries(LOGIN_ERROR_TEXTS)) {
+    assert.ok((await show(code)).includes(`<p class="error">${text}</p>`), code);
+  }
+  for (const attack of ["Your account is locked, call 555-0100", "constructor", "__proto__", "toString"]) {
+    const page = await show(attack);
+    assert.ok(page.includes(`<p class="error">${GENERIC_LOGIN_ERROR_TEXT}</p>`), attack);
+    assert.equal(page.includes(attack), false, attack);
+  }
+});
+
+test("login-action: login fallido, administrador rechazado, API caída y limitador mandan un código del conjunto cerrado", async () => {
+  const cases: Array<[Record<string, any>, string]> = [
+    [{ "POST /auth/login": { status: 401, data: { message: "texto de la API" } } }, "invalid_credentials"],
+    [{ "GET /permissions/admin-access": { status: 200, data: { administrator: false } } }, "admin_required"],
+    [{ "GET /permissions/admin-access": { status: 500, data: {} } }, "unavailable"],
+  ];
+  for (const [overrides, code] of cases) {
+    const { router } = buildRouter(fakeHttp(overrides).http);
+    const res = await post(router, loginBody());
+    assert.equal(new URL(`http://x${res.redirectedTo}`).searchParams.get("error"), code);
+  }
+  const { router } = buildRouter(fakeHttp().http, { limits: { login: { max: 0, windowMs: 300_000 } } });
+  const limited = await post(router, loginBody());
+  assert.equal(new URL(`http://x${limited.redirectedTo}`).searchParams.get("error"), "too_many_attempts");
+});
+
+test("login-action limitado sin redirect_uri: página 429 fija con las cabeceras de las páginas", async () => {
+  const { router } = buildRouter(fakeHttp().http, { limits: { login: { max: 0, windowMs: 300_000 } } });
+  const res = await post(router, { username: "u" });
+  assert.equal(res.statusCode, 429);
+  assert.equal(res.headers["cache-control"], "no-store");
+  assert.equal(res.headers["x-frame-options"], "DENY");
+  assert.ok(html(res).includes(RATE_LIMITED_PAGE_TEXT));
+});
+
+// ---------------- cabeceras de las páginas ----------------
+
+const assertPageHeaders = (res: { headers: Record<string, string> }, label: string) => {
+  assert.equal(res.headers["cache-control"], "no-store", `${label}: Cache-Control`);
+  assert.equal(res.headers["content-security-policy"], "frame-ancestors 'none'", `${label}: CSP`);
+  assert.equal(res.headers["x-frame-options"], "DENY", `${label}: X-Frame-Options`);
+};
+
+test("cabeceras: la página de login lleva no-store y no admite marcos", async () => {
+  const { router } = buildRouter(fakeHttp().http);
+  const res = await runRoute(router, "get", "/oauth/authorize", authorizeQuery());
+  assert.equal(res.statusCode, 200);
+  assertPageHeaders(res, "login");
+});
+
+test("cabeceras: las páginas de error (400, 503, 429) llevan no-store y no admiten marcos", async () => {
+  const bad = buildRouter(fakeHttp().http);
+  assertPageHeaders(await runRoute(bad.router, "get", "/oauth/authorize", authorizeQuery({ client_id: "no-existe" })), "authorize 400");
+  assertPageHeaders(await post(bad.router, loginBody({ client_id: "no-existe" })), "login-action 400");
+  const down = buildRouter(fakeHttp().http, { findClient: async () => ({ kind: "unavailable" }) });
+  assertPageHeaders(await runRoute(down.router, "get", "/oauth/authorize", authorizeQuery()), "authorize 503");
+  const limited = buildRouter(fakeHttp().http, { limits: { authorize: { max: 0, windowMs: 60_000 } } });
+  assertPageHeaders(await runRoute(limited.router, "get", "/oauth/authorize", authorizeQuery()), "authorize 429");
+});
+
+test("login-action: un fallo inesperado responde 503 con página fija, sin redirigir ni entregar código", async () => {
+  const before = pendingCodeCount();
+  const { router } = buildRouter(fakeHttp().http, {
+    api: { ...createGocAuthApi(fakeHttp().http), login: async () => { throw new Error("boom"); } },
+  });
+  const res = await post(router, loginBody());
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.redirectedTo, undefined);
+  assert.ok(html(res).includes(UNAVAILABLE_PAGE_TEXT));
+  assert.equal(html(res).includes("boom"), false);
+  assert.equal(pendingCodeCount(), before);
+  assertPageHeaders(res, "login-action 503");
+});
+
+// ---------------- authorize: política antes de la API y limitador ----------------
+
+test("authorize: una redirect_uri fuera de política se rechaza sin consultar la API de clientes", async () => {
+  let lookups = 0;
+  const { router } = buildRouter(fakeHttp().http, {
+    findClient: async () => { lookups += 1; return { kind: "found", clientName: "A", redirectUris: ["http://evil.test/cb"] }; },
+  });
+  for (const redirect_uri of ["http://evil.test/cb", "javascript:alert(1)", "https://a.test/cb#f"]) {
+    const res = await runRoute(router, "get", "/oauth/authorize", authorizeQuery({ redirect_uri }));
+    assert.equal(res.statusCode, 400, redirect_uri);
+  }
+  assert.equal(lookups, 0);
+  await runRoute(router, "get", "/oauth/authorize", authorizeQuery());
+  assert.equal(lookups, 1);
+});
+
+test("authorize: limitador por IP; excedido da 429 con página fija y Retry-After, sin consultar la API", async () => {
+  let lookups = 0;
+  const { router } = buildRouter(fakeHttp().http, {
+    limits: { authorize: { max: 2, windowMs: 60_000 } },
+    findClient: async () => { lookups += 1; return { kind: "found", clientName: "A", redirectUris: [REDIRECT] }; },
+  });
+  assert.equal((await runRoute(router, "get", "/oauth/authorize", authorizeQuery())).statusCode, 200);
+  assert.equal((await runRoute(router, "get", "/oauth/authorize", authorizeQuery())).statusCode, 200);
+  const limited = await runRoute(router, "get", "/oauth/authorize", authorizeQuery());
+  assert.equal(limited.statusCode, 429);
+  assert.ok(Number(limited.headers["retry-after"]) >= 1);
+  assert.ok(html(limited).includes(RATE_LIMITED_PAGE_TEXT));
+  assert.equal(html(limited).includes("<form"), false);
+  assert.equal(lookups, 2);
+  const other = await runRoute(router, "get", "/oauth/authorize", { ...authorizeQuery(), ip: "198.51.100.9" });
+  assert.equal(other.statusCode, 200);
+});
+
+test("authorize: el límite por defecto es 60 por minuto", () => {
+  assert.deepEqual(AUTHORIZE_RATE_LIMIT, { max: 60, windowMs: 60_000 });
+});
+
+// ---------------- redirect-uri: cliente registrado con https://localhost ----------------
+
+test("redirect-uri: un cliente registrado como https://localhost/cb no acepta http://localhost:1234/cb", () => {
+  assert.equal(matchesRegisteredRedirectUri("http://localhost:1234/cb", ["https://localhost/cb"]), false);
+  assert.equal(matchesRegisteredRedirectUri("http://127.0.0.1:1234/cb", ["https://127.0.0.1/cb"]), false);
+});
+
+// ---------------- client-registry: id devuelto y cableado real ----------------
+
+test("findOAuthClient: si la respuesta es de otro clientId (o no trae clientId) es unavailable", async () => {
+  for (const clientId of ["otro", undefined, 5]) {
+    const body = { success: true, data: { clientId, clientName: "N", redirectUris: ["https://a.test/cb"] } };
+    assert.deepEqual(await lookupWith(answer(200, body)), { kind: "unavailable" }, String(clientId));
+  }
+});
+
+test("createDefaultDeps: findClient consulta /mcp/clients/<id codificado> y devuelve el cliente registrado (sin red)", async () => {
+  const seen: Array<string | undefined> = [];
+  const adapter: AxiosAdapter = async (config) => {
+    seen.push(config.url);
+    const data = { success: true, data: { clientId: "id con/barra?", clientName: "N", redirectUris: ["https://a.test/cb"] } };
+    return { data, status: 200, statusText: "", headers: {}, config };
+  };
+  const original = axios.defaults.adapter;
+  axios.defaults.adapter = adapter;
+  try {
+    const deps = createDefaultDeps();
+    const lookup = await deps.findClient("id con/barra?");
+    assert.deepEqual(lookup, { kind: "found", clientName: "N", redirectUris: ["https://a.test/cb"] });
+    assert.ok(seen[0]?.endsWith("/mcp/clients/id%20con%2Fbarra%3F"), String(seen[0]));
+  } finally {
+    axios.defaults.adapter = original;
   }
 });

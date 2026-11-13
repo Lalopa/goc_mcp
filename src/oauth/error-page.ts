@@ -1,3 +1,6 @@
+import type { Response } from "express";
+import { frameGuard, noStore } from "./responses.js";
+
 // Página de error mínima para las rutas que ve una persona (/oauth/authorize, /oauth/login-action).
 // El texto es fijo: nunca se refleja nada que venga de la petición.
 export function renderErrorPage(message: string): string {
@@ -24,5 +27,13 @@ export function renderErrorPage(message: string): string {
 </html>`;
 }
 
+// Responde con la página de error y las cabeceras de las páginas de /oauth/* (sin caché, sin marcos).
+export function sendErrorPage(res: Response, status: number, message: string): void {
+  noStore(res);
+  frameGuard(res);
+  res.status(status).send(renderErrorPage(message));
+}
+
 export const INVALID_REQUEST_PAGE_TEXT = "The request could not be processed. Go back to the application and try connecting again.";
 export const UNAVAILABLE_PAGE_TEXT = "The service is temporarily unavailable. Go back to the application and try connecting again in a few minutes.";
+export const RATE_LIMITED_PAGE_TEXT = "Too many requests. Wait a few minutes, go back to the application and try connecting again.";
