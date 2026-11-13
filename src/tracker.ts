@@ -3,11 +3,6 @@ import type { McpRequestContext } from "./tracking-context.js";
 
 const API_PREFIX = "/mcp";
 
-interface SessionResponse {
-  success: boolean;
-  data: { id: number };
-}
-
 interface ActiveSessionResponse {
   success: boolean;
   data: { id: number } | null;
@@ -40,54 +35,6 @@ export class McpTracker {
     } catch {
       return this.sessionDbId;
     }
-  }
-
-  bindSession(sessionId: number): void {
-    this.sessionDbId = sessionId;
-  }
-
-  async createSession(data: {
-    mcpRefreshToken: string;
-    gocRefreshToken: string;
-    clientId?: string;
-    ipAddress?: string;
-    userAgent?: string;
-    metadata?: Record<string, unknown>;
-    expiresAt?: string;
-  }): Promise<number> {
-    const result = await this.client.post<SessionResponse>(`${API_PREFIX}/sessions`, data);
-    this.sessionDbId = result.data.id;
-    return this.sessionDbId;
-  }
-
-  async updateSession(id: number, data: {
-    status?: string;
-    mcpRefreshToken?: string;
-    gocRefreshToken?: string;
-    lastActivityAt?: string;
-  }): Promise<void> {
-    await this.client.patch(`${API_PREFIX}/sessions/${id}`, data);
-  }
-
-  async findSessionByToken(token: string): Promise<{
-    id: number;
-    status: string;
-    gocRefreshToken: string;
-    clientId?: string | null;
-  } | null> {
-    const result = await this.client.get<{
-      success: boolean;
-      data: {
-        id: number;
-        status: string;
-        gocRefreshToken: string;
-        clientId?: string | null;
-      } | null;
-    }>(
-      `${API_PREFIX}/sessions/find`,
-      { token }
-    );
-    return result.data;
   }
 
   logToolCall(data: {
