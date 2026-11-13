@@ -8,6 +8,8 @@ export interface RateLimitConfig {
 export const TOKEN_RATE_LIMIT: RateLimitConfig = { max: 60, windowMs: 60 * 1000 };
 export const LOGIN_RATE_LIMIT: RateLimitConfig = { max: 10, windowMs: 5 * 60 * 1000 };
 export const REVOKE_RATE_LIMIT: RateLimitConfig = { max: 30, windowMs: 60 * 1000 };
+/** El registro es anónimo y escribe en la API (que limita a 60/min por IP, compartida por todo el MCP). */
+export const REGISTER_RATE_LIMIT: RateLimitConfig = { max: 20, windowMs: 10 * 60 * 1000 };
 
 /** Tope de claves (cubos) por limitador: acota la memoria. */
 export const MAX_RATE_LIMIT_KEYS = 10_000;

@@ -1,12 +1,17 @@
 import { Router } from "express";
 import type { Request, RequestHandler, Response } from "express";
 import { renderLoginPage } from "./login-page.js";
+import { INVALID_REQUEST_PAGE_TEXT, UNAVAILABLE_PAGE_TEXT, renderErrorPage } from "./error-page.js";
+import { CODE_CHALLENGE_METHOD, isValidCodeChallenge } from "./pkce.js";
+import { MAX_REDIRECT_URIS, isAllowedRedirectUri, matchesRegisteredRedirectUri } from "./redirect-uri.js";
+import type { ClientLookup } from "./client-registry.js";
 import { createCode, redeemCode } from "./store.js";
 import type { GocAuthApi } from "./goc-auth-api.js";
 import { secondsUntilExpiry } from "./jwt.js";
 import { TEMPORARILY_UNAVAILABLE, noStore, oauthError, unavailable } from "./responses.js";
 import {
   LOGIN_RATE_LIMIT,
+  REGISTER_RATE_LIMIT,
   REVOKE_RATE_LIMIT,
   TOKEN_RATE_LIMIT,
   createRateLimiter,
@@ -25,16 +30,49 @@ export interface OauthDeps {
     redirectUris: string[];
     tokenEndpointAuthMethod?: string;
   }): Promise<void>;
+  /**
+   * Cliente registrado, para validar authorize y login-action. Falla cerrado: `unavailable` nunca
+   * equivale a «aceptar». No debe lanzar.
+   */
+  findClient(clientId: string): Promise<ClientLookup>;
   /** Solo recibe mensajes sin tokens ni datos del usuario. */
   log?: (message: string) => void;
   /** Configuración que requiere atención del operador (p. ej. API sin los endpoints nuevos). */
   logError?: (message: string) => void;
-  limits?: { token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig };
+  limits?: { token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig; register?: RateLimitConfig };
 }
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
 }
+
+const MAX_CLIENT_FIELD_LENGTH = 255;
+const MAX_AUTH_METHOD_LENGTH = 50;
+
+interface AuthorizationRequest {
+  client_id?: string;
+  redirect_uri?: string;
+  state?: string;
+  code_challenge?: string;
+  code_challenge_method?: string;
+  /** Solo se exige en authorize: el formulario de login existe únicamente para `code`. */
+  response_type?: string;
+}
+
+type AuthorizationCheck =
+  | {
+      ok: true;
+      client_id: string;
+      redirect_uri: string;
+      state?: string;
+      code_challenge: string;
+      code_challenge_method: string;
+      clientName: string;
+    }
+  // El cliente o la redirect_uri no son de fiar: página de error, jamás una redirección.
+  | { ok: false; kind: "page"; status: 400 | 503 }
+  // Cliente y redirect_uri válidos, pero la petición está incompleta: error OAuth a esa redirect_uri.
+  | { ok: false; kind: "redirect"; location: string };
 
 export const REFRESH_ENDPOINT_MISSING_MESSAGE =
   "oauth refresh: la API respondió 404 en el endpoint de renovación; la API no expone el endpoint " +
@@ -63,6 +101,61 @@ export function createOauthRouter(deps: OauthDeps): Router {
       oauthError(res, 429, TEMPORARILY_UNAVAILABLE, "Too many requests");
     }
   );
+  const registerLimit = rateLimitMiddleware(
+    createRateLimiter(deps.limits?.register ?? REGISTER_RATE_LIMIT),
+    (_req, res, retryAfter) => {
+      res.setHeader("Retry-After", String(retryAfter));
+      oauthError(res, 429, TEMPORARILY_UNAVAILABLE, "Too many requests");
+    }
+  );
+
+  // Validación compartida por authorize y login-action. Orden: cliente registrado → redirect_uri de ese
+  // cliente → response_type → PKCE. Hasta que el cliente y la redirect_uri no están verificados no se
+  // redirige a ningún sitio.
+  async function checkAuthorization(input: AuthorizationRequest, requireResponseType: boolean): Promise<AuthorizationCheck> {
+    const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = input;
+    if (!client_id || client_id.length > MAX_CLIENT_FIELD_LENGTH || !redirect_uri) return { ok: false, kind: "page", status: 400 };
+
+    const lookup = await deps.findClient(client_id).catch((): ClientLookup => ({ kind: "unavailable" }));
+    if (lookup.kind === "unavailable") {
+      log("oauth authorize: registro de clientes no disponible");
+      return { ok: false, kind: "page", status: 503 };
+    }
+    if (lookup.kind === "not_found" || !matchesRegisteredRedirectUri(redirect_uri, lookup.redirectUris)) {
+      return { ok: false, kind: "page", status: 400 };
+    }
+
+    const reject = (error: string, description: string): AuthorizationCheck => ({
+      ok: false,
+      kind: "redirect",
+      location: buildUrl(redirect_uri, { error, error_description: description, state }),
+    });
+    if (requireResponseType && response_type !== "code") {
+      return reject("unsupported_response_type", "response_type must be code");
+    }
+    if (!isValidCodeChallenge(code_challenge) || code_challenge_method !== CODE_CHALLENGE_METHOD) {
+      return reject("invalid_request", "PKCE with code_challenge_method=S256 is required");
+    }
+    return {
+      ok: true,
+      client_id,
+      redirect_uri,
+      state,
+      code_challenge,
+      code_challenge_method,
+      clientName: lookup.clientName,
+    };
+  }
+
+  const sendCheckFailure = (res: Response, check: Exclude<AuthorizationCheck, { ok: true }>) => {
+    noStore(res);
+    if (check.kind === "redirect") {
+      res.redirect(check.location);
+      return;
+    }
+    res.status(check.status).send(renderErrorPage(check.status === 503 ? UNAVAILABLE_PAGE_TEXT : INVALID_REQUEST_PAGE_TEXT));
+  };
+
   const loginLimit = rateLimitMiddleware(
     createRateLimiter(deps.limits?.login ?? LOGIN_RATE_LIMIT),
     (req, res, retryAfter) => {
@@ -75,9 +168,12 @@ export function createOauthRouter(deps: OauthDeps): Router {
       }
       res.redirect(
         buildUrl("/oauth/authorize", {
+          response_type: "code",
           redirect_uri,
           state: str(body.state),
           client_id: str(body.client_id),
+          code_challenge: str(body.code_challenge),
+          code_challenge_method: str(body.code_challenge_method),
           error: "Too many attempts. Please wait a few minutes and try again.",
         })
       );
@@ -111,11 +207,27 @@ export function createOauthRouter(deps: OauthDeps): Router {
     });
   });
 
-  router.post("/oauth/register", async (req, res) => {
+  router.post("/oauth/register", registerLimit, async (req, res) => {
     const { redirect_uris, client_name, token_endpoint_auth_method } = (req.body ?? {}) as Record<string, unknown>;
 
     if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
       res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris required" });
+      return;
+    }
+    // Misma política que la API (https o loopback): lo que ella rechazaría no debe salir como 500.
+    if (redirect_uris.length > MAX_REDIRECT_URIS || !redirect_uris.every(isAllowedRedirectUri)) {
+      res.status(400).json({
+        error: "invalid_redirect_uri",
+        error_description: "redirect_uris must be https or loopback (localhost, 127.0.0.1) URLs without fragment",
+      });
+      return;
+    }
+    if (
+      (client_name != null && (typeof client_name !== "string" || client_name.length > MAX_CLIENT_FIELD_LENGTH)) ||
+      (token_endpoint_auth_method != null &&
+        (typeof token_endpoint_auth_method !== "string" || token_endpoint_auth_method.length > MAX_AUTH_METHOD_LENGTH))
+    ) {
+      res.status(400).json({ error: "invalid_client_metadata", error_description: "client_name or token_endpoint_auth_method invalid" });
       return;
     }
 
@@ -151,37 +263,80 @@ export function createOauthRouter(deps: OauthDeps): Router {
     });
   });
 
-  router.get("/oauth/authorize", (req, res) => {
-    const { redirect_uri, state, client_id, error } = req.query as Record<string, string>;
-
-    if (!redirect_uri) {
-      res.status(400).send("Missing redirect_uri");
+  router.get("/oauth/authorize", async (req, res) => {
+    const q = req.query as Record<string, unknown>;
+    const check = await checkAuthorization(
+      {
+        client_id: str(q.client_id),
+        redirect_uri: str(q.redirect_uri),
+        state: str(q.state),
+        code_challenge: str(q.code_challenge),
+        code_challenge_method: str(q.code_challenge_method),
+        response_type: str(q.response_type),
+      },
+      true
+    );
+    if (!check.ok) {
+      sendCheckFailure(res, check);
       return;
     }
 
-    res.send(renderLoginPage({ redirect_uri, state, client_id, error }));
+    noStore(res);
+    res.send(
+      renderLoginPage({
+        redirect_uri: check.redirect_uri,
+        state: check.state,
+        client_id: check.client_id,
+        code_challenge: check.code_challenge,
+        code_challenge_method: check.code_challenge_method,
+        client_name: check.clientName,
+        error: str(q.error),
+      })
+    );
   });
 
+  // Orden: limitador → validación → login. El limitador va primero para que la fuerza bruta de contraseñas
+  // se frene igual con peticiones válidas o no, y para que las inválidas (que cuestan una consulta de
+  // cliente a la API) también tengan tope por IP. La validación va antes de `api.login`: una petición
+  // inválida no gasta una llamada de login ni deja pasar credenciales a la API.
   router.post("/oauth/login-action", loginLimit, async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const username = str(body.username);
     const password = str(body.password);
-    const redirect_uri = str(body.redirect_uri);
-    const state = str(body.state);
-    const client_id = str(body.client_id);
-
-    if (!redirect_uri) {
-      res.status(400).send("Missing redirect_uri");
-      return;
-    }
-
-    const fail = (message: string, reason: string) => {
-      // Sin usuario, contraseña ni el mensaje de la API.
-      log(`oauth login fallido: ${reason}`);
-      res.redirect(buildUrl("/oauth/authorize", { redirect_uri, state, client_id, error: message }));
-    };
 
     try {
+      const check = await checkAuthorization(
+        {
+          client_id: str(body.client_id),
+          redirect_uri: str(body.redirect_uri),
+          state: str(body.state),
+          code_challenge: str(body.code_challenge),
+          code_challenge_method: str(body.code_challenge_method),
+        },
+        false
+      );
+      if (!check.ok) {
+        sendCheckFailure(res, check);
+        return;
+      }
+      const { redirect_uri, state, client_id, code_challenge, code_challenge_method } = check;
+
+      const fail = (message: string, reason: string) => {
+        // Sin usuario, contraseña ni el mensaje de la API.
+        log(`oauth login fallido: ${reason}`);
+        res.redirect(
+          buildUrl("/oauth/authorize", {
+            response_type: "code",
+            redirect_uri,
+            state,
+            client_id,
+            code_challenge,
+            code_challenge_method,
+            error: message,
+          })
+        );
+      };
+
       if (!username || !password) {
         fail("Invalid credentials", "faltan credenciales");
         return;
@@ -202,10 +357,13 @@ export function createOauthRouter(deps: OauthDeps): Router {
         return;
       }
 
-      const code = createCode({ jwt: login.jwt, gocRefreshToken: login.gocRefreshToken, redirect_uri });
+      // La redirect_uri ya pasó la validación: el código nunca viaja a otra.
+      const code = createCode({ jwt: login.jwt, gocRefreshToken: login.gocRefreshToken, redirect_uri, client_id, code_challenge });
       res.redirect(buildUrl(redirect_uri, { code, state }));
     } catch {
-      fail("Unexpected error", "error inesperado");
+      log("oauth login fallido: error inesperado");
+      noStore(res);
+      if (!res.headersSent) res.status(503).send(renderErrorPage(UNAVAILABLE_PAGE_TEXT));
     }
   });
 
@@ -219,13 +377,14 @@ export function createOauthRouter(deps: OauthDeps): Router {
     if (grant_type === "authorization_code") {
       const code = str(body.code);
       const redirect_uri = str(body.redirect_uri);
+      const codeVerifier = str(body.code_verifier);
       // Se valida todo antes de redimir: un request incompleto no debe quemar el código.
-      if (!code || !redirect_uri || !clientId) {
-        oauthError(res, 400, "invalid_request", "Missing code, redirect_uri or client_id");
+      if (!code || !redirect_uri || !clientId || !codeVerifier) {
+        oauthError(res, 400, "invalid_request", "Missing code, redirect_uri, client_id or code_verifier");
         return;
       }
 
-      const result = redeemCode(code, { redirect_uri });
+      const result = redeemCode(code, { redirect_uri, client_id: clientId, code_verifier: codeVerifier });
       if (!result) {
         oauthError(res, 400, "invalid_grant", "Code expired or invalid");
         return;

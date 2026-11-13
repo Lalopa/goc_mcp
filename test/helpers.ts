@@ -134,6 +134,10 @@ export function buildDeps(http: HttpClient, overrides: Partial<OauthDeps> = {}) 
   const deps: OauthDeps = {
     api,
     mcpBaseUrl: "https://mcp.test",
+    findClient: async (clientId) =>
+      clientId === CLIENT_ID
+        ? { kind: "found", clientName: "Test Agent", redirectUris: [REDIRECT, "http://localhost:3000/callback"] }
+        : { kind: "not_found" },
     getClientMeta: async (clientId) => (clientId ? { client_id: clientId, client_name: "Test Agent" } : {}),
     registerClient: async () => {},
     log: (m) => logs.push(m),
@@ -196,14 +200,26 @@ export async function captureConsole<T>(fn: () => Promise<T>): Promise<{ result:
 }
 
 export const REDIRECT = "https://claude.test/callback";
+export const CLIENT_ID = "client-1";
+// Par de la especificación (RFC 7636, Apéndice B).
+export const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+export const CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+// Cuerpo válido de login-action; `extra` lo pisa (undefined elimina el campo).
+export function loginBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    username: "admin@example.com", password: SECRETS.password, redirect_uri: REDIRECT, state: "st",
+    client_id: CLIENT_ID, code_challenge: CHALLENGE, code_challenge_method: "S256", ...extra,
+  };
+  for (const k of Object.keys(body)) if (body[k] === undefined) delete body[k];
+  return body;
+}
 
 // Hace login por la ruta real y devuelve el código emitido.
-export async function loginAndGetCode(router: Router, redirect_uri: string = REDIRECT): Promise<string> {
-  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq({
-    username: "admin@example.com", password: SECRETS.password, redirect_uri, state: "st", client_id: "client-1",
-  }));
+export async function loginAndGetCode(router: Router, extra: Record<string, unknown> = {}): Promise<string> {
+  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody(extra)));
   const location = res.redirectedTo ?? "";
-  const code = new URL(location).searchParams.get("code");
+  const code = location.startsWith("http") ? new URL(location).searchParams.get("code") : null;
   if (!code) throw new Error(`login sin código: ${location}`);
   return code;
 }

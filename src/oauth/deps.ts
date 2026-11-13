@@ -1,4 +1,4 @@
-import { registerOAuthClientInApi, getClientTrackingMetadata } from "./client-registry.js";
+import { registerOAuthClientInApi, getClientTrackingMetadata, findOAuthClient } from "./client-registry.js";
 import { createAxiosHttpClient, createGocAuthApi } from "./goc-auth-api.js";
 import type { OauthDeps } from "./routes.js";
 import { GocApiClient } from "../api-client.js";
@@ -13,6 +13,7 @@ export function createDefaultDeps(): OauthDeps {
     api,
     mcpBaseUrl: process.env.MCP_BASE_URL!,
     getClientMeta: getClientTrackingMetadata,
+    findClient: findOAuthClient,
     registerClient: registerOAuthClientInApi,
   };
 }

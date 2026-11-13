@@ -2,12 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { pendingCodeCount } from "../src/oauth/store.js";
 import {
-  REDIRECT, SECRETS, buildRouter, captureConsole, fakeHttp, fakeReq, loginAndGetCode, makeJwt, nowSeconds, runRoute,
+  CHALLENGE, CLIENT_ID, REDIRECT, SECRETS, VERIFIER, buildRouter, captureConsole, fakeHttp, fakeReq, loginAndGetCode, loginBody, makeJwt, nowSeconds, runRoute,
 } from "./helpers.js";
 
 const tokenReq = (body: Record<string, unknown>, extra = {}) => fakeReq(body, extra);
 const codeBody = (code: string, extra: Record<string, unknown> = {}) => ({
-  grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: "client-1", ...extra,
+  grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: CLIENT_ID, code_verifier: VERIFIER, ...extra,
 });
 const refreshBody = (extra: Record<string, unknown> = {}) => ({
   grant_type: "refresh_token", refresh_token: SECRETS.clientRefreshToken, client_id: "client-1", ...extra,
@@ -297,9 +297,7 @@ test("ningún token aparece en logs ni en consola en ningún flujo", async () =>
 
 test("login-action: emite un código y redirige al redirect_uri con state", async () => {
   const { router } = buildRouter(fakeHttp().http);
-  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq({
-    username: "u", password: "p", redirect_uri: REDIRECT, state: "xyz", client_id: "c",
-  }));
+  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p", state: "xyz" })));
   const url = new URL(res.redirectedTo!);
   assert.equal(url.origin + url.pathname, REDIRECT);
   assert.equal(url.searchParams.get("state"), "xyz");
@@ -310,7 +308,7 @@ test("login-action: login sin refreshToken es error de login y no crea código",
   const f = fakeHttp({ "POST /auth/login": { status: 200, data: { token: makeJwt(nowSeconds() + 100) } } });
   const { router } = buildRouter(f.http);
   const before = pendingCodeCount();
-  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq({ username: "u", password: "p", redirect_uri: REDIRECT, client_id: "c" }));
+  const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p" })));
   assert.ok(res.redirectedTo!.startsWith("/oauth/authorize?"));
   assert.ok(new URL(`http://x${res.redirectedTo}`).searchParams.get("error"));
   assert.equal(new URL(`http://x${res.redirectedTo}`).searchParams.get("code"), null);
@@ -321,7 +319,7 @@ test("login-action: login fallido registra un warn sin usuario, contraseña ni m
   const f = fakeHttp({ "POST /auth/login": { status: 401, data: { message: "mensaje-de-la-api-sentinel" } } });
   const { router, logs } = buildRouter(f.http);
   const { output } = await captureConsole(() =>
-    runRoute(router, "post", "/oauth/login-action", fakeReq({ username: "usuario-sentinel", password: SECRETS.password, redirect_uri: REDIRECT }))
+    runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "usuario-sentinel" })))
   );
   const all = `${logs.join("\n")}\n${output}`;
   assert.ok(logs.length === 1);
@@ -349,7 +347,7 @@ test("rate limit /oauth/token: la petición N+1 da 429 JSON sin tocar la API; ot
 test("rate limit /oauth/login-action: exceso redirige con error y no llama al login", async () => {
   const f = fakeHttp();
   const { router } = buildRouter(f.http, { limits: { login: { max: 1, windowMs: 300_000 } } });
-  const body = { username: "u", password: "p", redirect_uri: REDIRECT, state: "s", client_id: "c" };
+  const body = loginBody({ username: "u", password: "p", state: "s" });
   await runRoute(router, "post", "/oauth/login-action", fakeReq(body));
   const loginCalls = f.callsTo("/auth/login").length;
   const limited = await runRoute(router, "post", "/oauth/login-action", fakeReq(body));

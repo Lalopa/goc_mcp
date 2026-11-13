@@ -4,26 +4,27 @@ import { createCode, redeemCode, pendingCodeCount, CODE_TTL_MS } from "../src/oa
 import { secondsUntilExpiry } from "../src/oauth/jwt.js";
 import { createRateLimiter } from "../src/oauth/rate-limit.js";
 import type { Bucket } from "../src/oauth/rate-limit.js";
-import { makeJwt } from "./helpers.js";
+import { CHALLENGE, VERIFIER, makeJwt } from "./helpers.js";
 
-const entry = { jwt: "j", gocRefreshToken: "g", redirect_uri: "https://a.test/cb" };
+const entry = { jwt: "j", gocRefreshToken: "g", redirect_uri: "https://a.test/cb", client_id: "c-1", code_challenge: CHALLENGE };
+const grant = { redirect_uri: entry.redirect_uri, client_id: entry.client_id, code_verifier: VERIFIER };
 
 test("store: el código es de un solo uso", () => {
   const code = createCode(entry);
-  assert.ok(redeemCode(code, { redirect_uri: entry.redirect_uri }));
-  assert.equal(redeemCode(code, { redirect_uri: entry.redirect_uri }), null);
+  assert.ok(redeemCode(code, grant));
+  assert.equal(redeemCode(code, grant), null);
 });
 
 test("store: un canje con redirect_uri distinta falla y también quema el código", () => {
   const code = createCode(entry);
-  assert.equal(redeemCode(code, { redirect_uri: "https://evil.test/cb" }), null);
-  assert.equal(redeemCode(code, { redirect_uri: entry.redirect_uri }), null);
+  assert.equal(redeemCode(code, { ...grant, redirect_uri: "https://evil.test/cb" }), null);
+  assert.equal(redeemCode(code, grant), null);
 });
 
 test("store: el código vence a los 5 minutos", () => {
   const t0 = 1_000_000;
   const code = createCode(entry, t0);
-  assert.equal(redeemCode(code, { redirect_uri: entry.redirect_uri }, t0 + CODE_TTL_MS + 1), null);
+  assert.equal(redeemCode(code, grant, t0 + CODE_TTL_MS + 1), null);
 });
 
 test("store: los códigos vencidos sin canjear se barren al crear otro", () => {

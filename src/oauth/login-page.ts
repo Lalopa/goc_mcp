@@ -2,11 +2,27 @@ export interface LoginPageParams {
   redirect_uri: string;
   state?: string;
   client_id?: string;
+  code_challenge: string;
+  code_challenge_method: string;
+  /** Nombre registrado del cliente (texto libre de quien se registró: siempre escapado). */
+  client_name?: string;
   error?: string;
 }
 
+function hostOf(uri: string): string {
+  try {
+    return new URL(uri).host;
+  } catch {
+    return "";
+  }
+}
+
 export function renderLoginPage(params: LoginPageParams): string {
-  const { redirect_uri, state = "", client_id = "", error } = params;
+  const { redirect_uri, state = "", client_id = "", code_challenge, code_challenge_method, client_name = "", error } = params;
+  const host = hostOf(redirect_uri);
+  const connecting = client_name || host
+    ? `<p class="client">Connecting: <strong>${escapeHtml(client_name || "Unnamed client")}</strong>${host ? ` (returns to ${escapeHtml(host)})` : ""}</p>`
+    : "";
 
   const errorBlock = error
     ? `<p class="error">${escapeHtml(error)}</p>`
@@ -78,6 +94,12 @@ export function renderLoginPage(params: LoginPageParams): string {
       transition: background 0.15s;
     }
     button:hover { background: #3d5ce6; }
+    .client {
+      font-size: 13px;
+      color: #444;
+      margin-bottom: 16px;
+      word-break: break-word;
+    }
     .error {
       background: #fff0f0;
       color: #c0392b;
@@ -93,11 +115,14 @@ export function renderLoginPage(params: LoginPageParams): string {
   <div class="card">
     <div class="logo">GOC</div>
     <div class="subtitle">Sign in to connect Claude with your account</div>
+    ${connecting}
     ${errorBlock}
     <form method="POST" action="/oauth/login-action">
       <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
       <input type="hidden" name="state" value="${escapeHtml(state)}">
       <input type="hidden" name="client_id" value="${escapeHtml(client_id)}">
+      <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge)}">
+      <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method)}">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" required autofocus placeholder="username">
       <label for="password">Password</label>
@@ -114,5 +139,6 @@ function escapeHtml(str: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

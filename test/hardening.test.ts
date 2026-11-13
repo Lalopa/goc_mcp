@@ -12,7 +12,7 @@ import { CLIENT_REGISTRY_TIMEOUT_MS, getClientTrackingMetadata, registerOAuthCli
 import { REFRESH_ENDPOINT_MISSING_MESSAGE, REVOKE_ENDPOINT_MISSING_MESSAGE } from "../src/oauth/routes.js";
 import { pendingCodeCount } from "../src/oauth/store.js";
 import {
-  REDIRECT, SECRETS, buildDeps, buildRouter, captureConsole, fakeHttp, fakeReq, fakeRes, invokeApp, loginAndGetCode, runRoute,
+  CLIENT_ID, REDIRECT, SECRETS, VERIFIER, buildDeps, buildRouter, captureConsole, fakeHttp, fakeReq, fakeRes, invokeApp, loginAndGetCode, loginBody, runRoute,
 } from "./helpers.js";
 
 // ---------------- trust proxy ----------------
@@ -196,7 +196,7 @@ test("canje: si getClientMeta lanza, el canje sigue sin nombre de cliente", asyn
   const { router } = buildRouter(f.http, { getClientMeta: async () => { throw new Error("boom"); } });
   const code = await loginAndGetCode(router);
   const res = await runRoute(router, "post", "/oauth/token", fakeReq({
-    grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: "client-1",
+    grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: CLIENT_ID, code_verifier: VERIFIER,
   }));
   assert.equal(res.statusCode, 200);
   assert.deepEqual((f.callsTo("/mcp/sessions")[0].body as any).metadata, { client_id: "client-1" });
@@ -363,7 +363,7 @@ test("login-action: administrador rechazado (403 o administrator:false) vuelve a
   for (const response of [{ status: 403, data: {} }, { status: 200, data: { administrator: false } }]) {
     const { router } = buildRouter(fakeHttp({ "GET /permissions/admin-access": response }).http);
     const before = pendingCodeCount();
-    const res = await runRoute(router, "post", "/oauth/login-action", fakeReq({ username: "u", password: "p", redirect_uri: REDIRECT, client_id: "c" }));
+    const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p" })));
     assert.ok(res.redirectedTo!.startsWith("/oauth/authorize?"));
     assert.equal(errorParam(res.redirectedTo), "Administrator access required");
     assert.equal(pendingCodeCount(), before);
@@ -374,7 +374,7 @@ test("login-action: API no disponible al verificar al administrador vuelve al lo
   for (const response of [{ status: 500, data: {} }, { status: 429, data: {} }, new Error("red")]) {
     const { router } = buildRouter(fakeHttp({ "GET /permissions/admin-access": response }).http);
     const before = pendingCodeCount();
-    const res = await runRoute(router, "post", "/oauth/login-action", fakeReq({ username: "u", password: "p", redirect_uri: REDIRECT, client_id: "c" }));
+    const res = await runRoute(router, "post", "/oauth/login-action", fakeReq(loginBody({ username: "u", password: "p" })));
     assert.equal(errorParam(res.redirectedTo), "Service temporarily unavailable");
     assert.equal(pendingCodeCount(), before);
   }
@@ -384,7 +384,7 @@ test("canje: administrator:false al canjear da invalid_grant y no llama al alta"
   const code = await loginAndGetCode(buildRouter(fakeHttp().http).router);
   const f = fakeHttp({ "GET /permissions/admin-access": { status: 200, data: { administrator: false } } });
   const { router } = buildRouter(f.http);
-  const res = await runRoute(router, "post", "/oauth/token", fakeReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: "c" }));
+  const res = await runRoute(router, "post", "/oauth/token", fakeReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, client_id: CLIENT_ID, code_verifier: VERIFIER }));
   assert.equal((res.body as any).error, "invalid_grant");
   assert.equal(f.callsTo("/mcp/sessions").length, 0);
 });
