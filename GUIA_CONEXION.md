@@ -10,7 +10,7 @@ Con esta configuración podrás preguntarle a Claude cosas como:
 ## Requisitos
 
 - Tener instalado **Claude Desktop** (Mac/Windows) o **Claude Code** (terminal/VS Code)
-- Tener una cuenta activa en el sistema GOC
+- Ser **administrador activo** del sistema GOC (otras cuentas no pueden usar el MCP)
 
 ---
 
@@ -151,7 +151,7 @@ El MCP incluye **17 herramientas**. Solo `permissions_edit` modifica datos; el r
 
 - El acceso es solo para **administradores activos** de GOC. Si pierdes ese rol o tu usuario se desactiva, el MCP deja de responderte.
 - Claude renueva tu sesión **solo, sin pedirte login**: el acceso dura 2 horas y se renueva en segundo plano.
-- Tendrás que iniciar sesión otra vez si pasan **30 días sin usar el MCP**, o **90 días desde el último login** aunque lo uses a diario.
+- Tendrás que iniciar sesión otra vez si pasan **30 días sin renovar la sesión** (en la práctica, sin usar el MCP), o **90 días desde el último login** aunque lo uses a diario.
 - También se pide login de nuevo si la sesión se revocó: por ejemplo, si se presenta una credencial de renovación ya usada más de un minuto después de usarse.
 - Al **desconectar** el MCP la sesión se revoca, pero el acceso ya emitido puede seguir funcionando hasta 2 horas.
 
@@ -162,5 +162,5 @@ El MCP incluye **17 herramientas**. Solo `permissions_edit` modifica datos; el r
 - Cada usuario se autentica con **su propia cuenta GOC** — los permisos del sistema aplican igual
 - Si tu sesión expira o se revoca, vuelve a autenticarte desde `/mcp` (Claude Code) o reiniciando la app (Claude Desktop)
 - Si algo falla de forma temporal (el servidor no responde), Claude conserva tu sesión y vuelve a intentarlo; no necesitas iniciar sesión de nuevo
-- Si tras el login el navegador muestra «solicitud no válida», vuelve a la aplicación y conéctate otra vez
+- Si tras el login el navegador muestra una página con «The request could not be processed. Go back to the application and try connecting again.» (o «The service is temporarily unavailable…» o «Too many requests…»), vuelve a la aplicación y conéctate otra vez
 - Si ves que la página de login muestra otro destino de retorno (host) distinto al de tu aplicación, **no inicies sesión**

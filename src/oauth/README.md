@@ -49,7 +49,7 @@ Cliente MCP                   MCP Server                          goc_api
 3. **Login** (`POST /oauth/login-action`). Repite **toda** la validación del paso anterior en el servidor (los campos ocultos del formulario no son de fiar), y solo entonces llama a `goc_api` para el login y para comprobar que el usuario es administrador activo. Si todo va bien redirige a la `redirect_uri` con un `code` de un solo uso (TTL 5 min).
 4. **Canje** (`POST /oauth/token`, `grant_type=authorization_code`). Exige `code`, `redirect_uri`, `client_id` y `code_verifier`; los mismos `redirect_uri` y `client_id` de authorize y un verificador que cumpla PKCE. Vuelve a comprobar que el usuario es administrador, da de alta la sesión en la API (que genera el refresh token) y devuelve `access_token`, `refresh_token` y `expires_in`.
 5. **Renovación** (`POST /oauth/token`, `grant_type=refresh_token`). Solo necesita `refresh_token` y `client_id` en el cuerpo: **no lleva encabezado `Authorization`**. La API valida la sesión, rota el refresh token y emite un access token nuevo; el MCP devuelve el par. El refresh token queda ligado al `client_id` con el que se creó la sesión.
-6. **Revocación** (`POST /oauth/revoke`, RFC 7009). Pasa el `token` del cuerpo a la API, que revoca la sesión a la que pertenece ese refresh token. Siempre responde `200 {}`, también si el token es desconocido o la API falla (el fallo queda en el log del servidor, sin el token).
+6. **Revocación** (`POST /oauth/revoke`, RFC 7009). Pasa el `token` del cuerpo a la API, que revoca la sesión a la que pertenece ese refresh token. Responde `200 {}` también si el token es desconocido o la API falla (el fallo queda en el log del servidor, sin el token). Las únicas excepciones son el limitador (`429`) y un cuerpo ilegible (`400 invalid_request`).
 
 Cuando el access token vence, `POST /mcp` responde `401` con `WWW-Authenticate` y el cliente renueva solo.
 
@@ -75,7 +75,7 @@ Por eso todo fallo transitorio (API caída, timeout, 429, 5xx, 404 por API sin d
 | | 429 | Página de error fija + `Retry-After` | Más de 60 peticiones por minuto desde la misma IP |
 | | 503 | Página de error fija | La API de clientes no responde o devuelve algo inválido (falla cerrado: nunca se acepta por defecto) |
 | `POST /oauth/login-action` | 302 | A la `redirect_uri` con `code` y `state` | Login correcto y administrador activo |
-| | 302 | De vuelta a `/oauth/authorize` con `error=<código>` | `invalid_credentials`, `admin_required`, `unavailable` o `too_many_attempts` (más de 10 intentos en 5 min por IP). Conserva todos los parámetros |
+| | 302 | De vuelta a `/oauth/authorize` con `error=<código>` | `invalid_credentials` (solo si la API responde 400/401 al login, o faltan usuario o contraseña), `admin_required`, `unavailable` (la API no responde, da 5xx o 429, o contesta sin token) o `too_many_attempts` (más de 10 intentos en 5 min por IP). Conserva todos los parámetros |
 | | 400, 503, 302 a la `redirect_uri` | Igual que authorize | Falla la validación de cliente, URI o PKCE; en ese caso no se llama al login |
 | | 429 | Página de error fija | Limitador, si la petición no trae `redirect_uri` |
 | | 503 | Página de error fija | Fallo inesperado (no se entrega código) |
@@ -90,7 +90,8 @@ Por eso todo fallo transitorio (API caída, timeout, 429, 5xx, 404 por API sin d
 | `POST /oauth/token` (ambos) | 400 | `unsupported_grant_type` | `grant_type` distinto de los dos soportados |
 | | 400 | `invalid_request` | Cuerpo ilegible (JSON roto, demasiado grande) |
 | | 429 | `temporarily_unavailable` + `Retry-After` | Más de 60 peticiones por minuto desde la misma IP |
-| `POST /oauth/revoke` | 200 | `{}` | Siempre, salvo el limitador |
+| `POST /oauth/revoke` | 200 | `{}` | Token válido, desconocido, ausente, o la API falla |
+| | 400 | `invalid_request` | Cuerpo ilegible (JSON roto, demasiado grande) |
 | | 429 | `temporarily_unavailable` + `Retry-After` | Más de 30 peticiones por minuto desde la misma IP |
 
 Todas las respuestas de `/oauth/token` y `/oauth/revoke` llevan `Cache-Control: no-store`. En `/oauth/*`, un cuerpo ilegible en las rutas del navegador (`authorize`, `login-action`) da una página de error fija y en las demás un JSON `invalid_request`; un error inesperado, `503` (`temporarily_unavailable` o página fija). Las rutas se comparan sin distinguir mayúsculas ni barra final, igual que Express las enruta.
@@ -114,10 +115,10 @@ Todas las respuestas de `/oauth/token` y `/oauth/revoke` llevan `Cache-Control: 
 
 ### Página de login
 
-Cualquiera puede registrar un cliente (`client_name` y `redirect_uri` son de quien se registra), así que la página no debe permitir hacerse pasar por otra aplicación:
+Cualquiera puede registrar un cliente: el nombre lo elige quien lo registra y la página **no puede garantizar que sea la aplicación que dice ser**. Lo único fiable es el host de la `redirect_uri` (a dónde vuelve el usuario). Por eso:
 
 - El host de la `redirect_uri` va **primero y en su propia línea**; el nombre del cliente va después.
-- El nombre se muestra sin caracteres de control ni de formato Unicode (incluidos los que invierten el sentido del texto), recortado y dentro de `<bdi>`, siempre escapado.
+- El nombre se muestra sin caracteres de control, de formato Unicode (incluidos los que invierten el sentido del texto) ni marcas combinantes (texto «Zalgo»), recortado, dentro de `<bdi>`, en una sola línea con elipsis y siempre escapado.
 - El subtítulo no afirma de qué aplicación se trata.
 - `?error=` **no** se muestra como texto libre: es un código de un conjunto cerrado (`invalid_credentials`, `too_many_attempts`, `admin_required`, `unavailable`) con un texto fijo por código; cualquier otro valor muestra un texto genérico.
 - La página y las de error llevan `Cache-Control: no-store`, `Content-Security-Policy: frame-ancestors 'none'` y `X-Frame-Options: DENY`.

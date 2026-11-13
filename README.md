@@ -177,7 +177,7 @@ TRUST_PROXY_HOPS=1
 | `GOC_API_URL` | URL base del backend, con el prefijo `/api/v2` |
 | `MCP_BASE_URL` | URL pública de este servidor (sin barra final); aparece en los metadatos OAuth |
 | `PORT` | Puerto de escucha (por defecto 3002) |
-| `TRUST_PROXY_HOPS` | Número de proxies de confianza delante del MCP. Entero ≥ 0; vacío, negativo, decimal o texto caen a `1`. Por defecto `1` (nginx delante) |
+| `TRUST_PROXY_HOPS` | Número de proxies de confianza delante del MCP. Entero ≥ 0 de hasta 3 cifras; vacío, negativo, decimal, texto o un número de 4 o más cifras caen a `1`. Por defecto `1` (nginx delante) |
 
 Ver [.env.example](.env.example) para referencia. Nunca subas el `.env` real.
 
@@ -191,8 +191,8 @@ De este valor depende `req.ip`, que usan los limitadores de tasa y los eventos q
 Cómo comprobarlo en el servidor:
 
 1. nginx debe mandar la IP del cliente en `X-Forwarded-For`, por ejemplo con `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` en el `location` que apunta al MCP.
-2. Haz una renovación de prueba (ver «Prueba de humo») desde una máquina cuya IP pública conozcas y mira el evento `token_refresh` en `mcp_events`: el campo `ip_address` debe ser **tu IP pública**.
-3. Repite añadiendo `-H 'X-Forwarded-For: 1.2.3.4'` al `curl`: el evento debe seguir mostrando tu IP, no `1.2.3.4`. Si muestra `1.2.3.4`, el valor es mayor que el número real de proxies; si muestra la IP de un proxy o del propio servidor (p. ej. `127.0.0.1`), es menor o nginx no está mandando `X-Forwarded-For`.
+2. Haz las renovaciones de los pasos 5 y 6 de la «Prueba de humo» desde una máquina cuya IP pública conozcas y mira los eventos `token_refresh` en `mcp_events`: el campo `ip_address` debe ser **tu IP pública**.
+3. El paso 6 añade `-H 'X-Forwarded-For: 1.2.3.4'` al `curl`: su evento debe seguir mostrando tu IP, no `1.2.3.4`. Si muestra `1.2.3.4`, el valor es mayor que el número real de proxies; si muestra la IP de un proxy o del propio servidor (p. ej. `127.0.0.1`), es menor o nginx no está mandando `X-Forwarded-For`.
 
 ## Desarrollo local
 
@@ -232,9 +232,13 @@ Las herramientas de permisos reutilizan tablas existentes y no necesitan migraci
 
 ## Prueba de humo tras desplegar
 
-Verifica la renovación contra el servidor real. Los marcadores `<MCP_BASE_URL>`, `<CLIENT_ID>` y `<REFRESH_TOKEN>` se sustituyen por los valores reales; **no pegues tokens reales en chats, tickets ni en el historial del shell**.
+Verifica la renovación contra el servidor real. Corre los pasos **de corrido y en este orden**, en una misma terminal (bash o zsh), porque cada uno usa variables del anterior.
 
-**Obtener un refresh token de prueba sin exponerlo.** Registra un cliente propio, haz el login en el navegador y guarda la respuesta del canje en un archivo privado:
+**Requisitos:** `curl`, `jq`, `openssl`, una cuenta GOC con rol Administrador y acceso de lectura a la tabla `mcp_events` de la API.
+
+**Marcadores** que debes sustituir por los valores reales: `<MCP_BASE_URL>` (URL pública del MCP, o `http://localhost:3002` en local), `<CLIENT_ID>` (el que devuelve el registro del paso 1) y `<CODE>` (el `code` que copias en el paso 3). El refresh token nunca se escribe a mano: vive en la variable `$REFRESH_TOKEN` (lo que en otros documentos se llamaría `<REFRESH_TOKEN>`). **No pegues tokens reales en chats, tickets ni en el historial del shell.**
+
+**1 a 4. Obtener un refresh token de prueba sin exponerlo.** Registra un cliente propio, haz el login en el navegador y guarda la respuesta del canje en un archivo privado:
 
 ```bash
 # 1. Cliente de prueba (anota el client_id de la respuesta)
@@ -245,7 +249,7 @@ curl -sS -X POST <MCP_BASE_URL>/oauth/register -H 'Content-Type: application/jso
 VERIFIER=$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' | cut -c1-64)
 CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 
-# 3. Abre en el navegador, inicia sesión con una cuenta administradora y copia el `code`
+# 3. Abre la URL en el navegador, inicia sesión con una cuenta administradora y copia el `code`
 #    de la barra de direcciones (la página de callback dará error de conexión: es normal)
 echo "<MCP_BASE_URL>/oauth/authorize?response_type=code&client_id=<CLIENT_ID>&redirect_uri=http://localhost:9999/callback&state=x&code_challenge=$CHALLENGE&code_challenge_method=S256"
 
@@ -257,7 +261,7 @@ curl -sS -X POST <MCP_BASE_URL>/oauth/token \
 read -r REFRESH_TOKEN < <(jq -r .refresh_token /tmp/humo.json)
 ```
 
-**Renovar sin `Authorization`** (el token va por stdin para que no aparezca en la lista de procesos, y la respuesta a un archivo para no mostrarla):
+**5. Renovar sin `Authorization`** (el token va por stdin para que no aparezca en la lista de procesos, y la respuesta a un archivo para no mostrarla):
 
 ```bash
 REFRESH_TOKEN_VIEJO=$REFRESH_TOKEN
@@ -265,11 +269,22 @@ printf 'grant_type=refresh_token&client_id=<CLIENT_ID>&refresh_token=%s' "$REFRE
   | curl -sS -o /tmp/humo2.json -w '%{http_code}\n' -X POST <MCP_BASE_URL>/oauth/token --data @-
 jq --rawfile viejo <(printf %s "$REFRESH_TOKEN_VIEJO") \
   '{token_type, expires_in, rotado: (.refresh_token != $viejo), access_token_presente: (.access_token != null)}' /tmp/humo2.json
+read -r REFRESH_TOKEN < <(jq -r .refresh_token /tmp/humo2.json)   # desde aquí, el token vigente es el nuevo
 ```
 
-Debe imprimir `200` y un resumen con `expires_in` ≈ 7200, `rotado: true` y `access_token_presente: true`: el par nuevo llegó y el `refresh_token` es distinto del enviado. Al terminar borra los archivos (`rm /tmp/humo.json /tmp/humo2.json`).
+Debe imprimir `200` y un resumen con `expires_in` ≈ 7200, `rotado: true` y `access_token_presente: true`: el par nuevo llegó y el `refresh_token` es distinto del enviado. `$REFRESH_TOKEN_VIEJO` se conserva para el paso 7.
 
-**Reuso del token viejo** (espera más de 60 s tras la renovación anterior y repite la misma petición con el token **viejo**):
+**6. Comprobar la IP (`TRUST_PROXY_HOPS`).** Renueva otra vez, ahora con el token **nuevo** del paso anterior y falsificando `X-Forwarded-For`. Hazlo antes del paso 7: el reuso revoca la sesión y ya no se podría renovar.
+
+```bash
+printf 'grant_type=refresh_token&client_id=<CLIENT_ID>&refresh_token=%s' "$REFRESH_TOKEN" \
+  | curl -sS -o /tmp/humo3.json -w '%{http_code}\n' -H 'X-Forwarded-For: 1.2.3.4' -X POST <MCP_BASE_URL>/oauth/token --data @-
+read -r REFRESH_TOKEN < <(jq -r .refresh_token /tmp/humo3.json)
+```
+
+Debe imprimir `200`. En `mcp_events` (ver el paso 8), los eventos `token_refresh` de los pasos 5 y 6 deben mostrar tu IP pública en `ip_address`, y **ninguno** `1.2.3.4`. Cómo interpretar otros valores: ver «Elegir `TRUST_PROXY_HOPS`».
+
+**7. Reuso del token viejo.** Espera más de 60 s y presenta el token **viejo** del paso 5 (ya fue usado):
 
 ```bash
 sleep 70
@@ -277,18 +292,26 @@ printf 'grant_type=refresh_token&client_id=<CLIENT_ID>&refresh_token=%s' "$REFRE
   | curl -sS -X POST <MCP_BASE_URL>/oauth/token --data @-
 ```
 
-Debe devolver `400 {"error":"invalid_grant", ...}`, y a partir de ahí **también el token nuevo deja de servir**: la API revocó la sesión por reuso. Si la respuesta es `503 temporarily_unavailable`, la API no tiene los endpoints (revisa el orden de despliegue y el `console.error` en el log del MCP).
+Debe devolver `400 {"error":"invalid_grant", ...}`, y a partir de ahí **también el token vigente deja de servir**: la API revocó la sesión por reuso. Si la respuesta es `503 temporarily_unavailable`, no es necesariamente que falten los endpoints: la API pudo responder 429, un 5xx o no contestar. Se distinguen en el log del MCP: un 404 de la API deja el `console.error` fijo `oauth refresh: la API respondió 404 en el endpoint de renovación…` (API sin desplegar o `GOC_API_URL` mal configurada); los demás casos dejan `oauth refresh unavailable status=<código>` (`n/a` si hubo timeout o error de red). Si es el 404, revisa el orden de despliegue.
 
-**Dónde ver los eventos.** En la tabla `mcp_events` de la base de la API, `event_type = 'token_refresh'` para cada renovación correcta, `token_refresh_failed` para las rechazadas (con el motivo en `metadata`) y `token_revoked` para «Desconectar»:
+**8. Dónde ver los eventos.** En la tabla `mcp_events` de la base de la API:
 
 ```sql
 SELECT event_type, user_id, client_id, ip_address, created_at, metadata
 FROM v2.mcp_events
 WHERE event_type IN ('token_refresh', 'token_refresh_failed', 'token_revoked')
+  AND client_id = '<CLIENT_ID>'
 ORDER BY created_at DESC LIMIT 20;
 ```
 
-Los eventos no llevan tokens.
+Esperado: dos `token_refresh` (pasos 5 y 6) y, tras el paso 7, un `token_refresh_failed` con `metadata.reason = 'reuse'` (no un `token_refresh`). `token_revoked` aparece al «Desconectar». Los eventos no llevan tokens.
+
+**9. Limpieza.** Borra los archivos con tokens y las variables:
+
+```bash
+rm -f /tmp/humo.json /tmp/humo2.json /tmp/humo3.json
+unset REFRESH_TOKEN REFRESH_TOKEN_VIEJO VERIFIER CHALLENGE
+```
 
 ## Configuración en Claude Code
 
