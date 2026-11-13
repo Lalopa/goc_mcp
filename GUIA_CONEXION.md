@@ -116,7 +116,7 @@ Una vez autenticado en cualquiera de las dos opciones, simplemente habla con Cla
 
 ## Herramientas disponibles
 
-El MCP incluye **14 herramientas** de solo lectura:
+El MCP incluye **17 herramientas**. Solo `permissions_edit` modifica datos; el resto consulta.
 
 **Empleados**
 - `employee_search` — Buscar por nombre
@@ -129,6 +129,7 @@ El MCP incluye **14 herramientas** de solo lectura:
 - `attendance_detail` — Detalle de un registro (quién, cuándo, cómo)
 - `attendance_summary` — Resumen por obra y día
 - `attendance_stats` — Estadísticas generales
+- `attendance_errors` — Intentos fallidos de registro o verificación
 
 **Pedidos**
 - `order_detail` — Detalle completo de un pedido
@@ -140,10 +141,26 @@ El MCP incluye **14 herramientas** de solo lectura:
 - `project_detail` — Detalle de una obra
 - `project_employees` — Empleados en una obra
 
+**Permisos**
+- `permissions_view` — Consultar permisos por módulo, rol, usuario u obra
+- `permissions_edit` — Modificar permisos de un rol o asignarlos y revocarlos por obra
+
+---
+
+## Sesión y renovación
+
+- El acceso es solo para **administradores activos** de GOC. Si pierdes ese rol o tu usuario se desactiva, el MCP deja de responderte.
+- Claude renueva tu sesión **solo, sin pedirte login**: el acceso dura 2 horas y se renueva en segundo plano.
+- Tendrás que iniciar sesión otra vez si pasan **30 días sin usar el MCP**, o **90 días desde el último login** aunque lo uses a diario.
+- También se pide login de nuevo si la sesión se revocó: por ejemplo, si se presenta una credencial de renovación ya usada más de un minuto después de usarse.
+- Al **desconectar** el MCP la sesión se revoca, pero el acceso ya emitido puede seguir funcionando hasta 2 horas.
+
 ---
 
 ## Notas
 
-- El MCP es de **solo lectura** — no puede crear ni modificar datos
 - Cada usuario se autentica con **su propia cuenta GOC** — los permisos del sistema aplican igual
-- Si tu sesión expira, vuelve a autenticarte desde `/mcp` (Claude Code) o reiniciando la app (Claude Desktop)
+- Si tu sesión expira o se revoca, vuelve a autenticarte desde `/mcp` (Claude Code) o reiniciando la app (Claude Desktop)
+- Si algo falla de forma temporal (el servidor no responde), Claude conserva tu sesión y vuelve a intentarlo; no necesitas iniciar sesión de nuevo
+- Si tras el login el navegador muestra «solicitud no válida», vuelve a la aplicación y conéctate otra vez
+- Si ves que la página de login muestra otro destino de retorno (host) distinto al de tu aplicación, **no inicies sesión**
