@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import express from "express";
 import axios, { AxiosError } from "axios";
@@ -8,11 +7,12 @@ import type { AxiosAdapter, InternalAxiosRequestConfig } from "axios";
 import { createAxiosHttpClient, createGocAuthApi } from "../src/oauth/goc-auth-api.js";
 import { configureTrustProxy, parseTrustProxyHops } from "../src/oauth/trust-proxy.js";
 import { createOauthErrorHandler } from "../src/oauth/error-handler.js";
+import { createApp } from "../src/app.js";
 import { CLIENT_REGISTRY_TIMEOUT_MS, getClientTrackingMetadata, registerOAuthClientInApi } from "../src/oauth/client-registry.js";
 import { REFRESH_ENDPOINT_MISSING_MESSAGE, REVOKE_ENDPOINT_MISSING_MESSAGE } from "../src/oauth/routes.js";
 import { pendingCodeCount } from "../src/oauth/store.js";
 import {
-  REDIRECT, SECRETS, buildRouter, captureConsole, fakeHttp, fakeReq, fakeRes, loginAndGetCode, runRoute,
+  REDIRECT, SECRETS, buildDeps, buildRouter, captureConsole, fakeHttp, fakeReq, fakeRes, invokeApp, loginAndGetCode, runRoute,
 } from "./helpers.js";
 
 // ---------------- trust proxy ----------------
@@ -47,12 +47,79 @@ test("trust-proxy: con 0 saltos req.ip es la conexión directa", () => {
   assert.equal(requestThrough(app, "6.6.6.6").ip, "10.0.0.1");
 });
 
-test("index.ts: trust proxy sale de TRUST_PROXY_HOPS y el manejador de errores OAuth está montado", () => {
-  const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf-8");
-  assert.match(src, /configureTrustProxy\(app, process\.env\.TRUST_PROXY_HOPS\)/);
-  assert.doesNotMatch(src, /set\("trust proxy", true\)/);
-  assert.match(src, /app\.use\(createOauthErrorHandler\(\)\)/);
-  assert.ok(src.indexOf("createOauthErrorHandler()") > src.indexOf("express.json()"), "después de los parsers");
+function appWith(hops: string | undefined, overrides = {}) {
+  const f = fakeHttp();
+  const { deps, logs } = buildDeps(f.http, overrides);
+  return { app: createApp(deps, { trustProxyHops: hops }), f, logs };
+}
+
+const refreshRequest = (forwardedFor?: string) => ({
+  method: "POST",
+  url: "/oauth/token",
+  headers: {
+    "content-type": "application/json",
+    ...(forwardedFor ? { "x-forwarded-for": forwardedFor } : {}),
+  },
+  body: JSON.stringify({ grant_type: "refresh_token", refresh_token: "r", client_id: "c" }),
+});
+
+test("app: la IP que llega a la API sale de TRUST_PROXY_HOPS (0, 1 y 2 saltos) y no de lo que escribe el cliente", async () => {
+  const xff = "6.6.6.6, 7.7.7.7, 203.0.113.5";
+  const seen: Record<string, unknown> = {};
+  for (const hops of ["0", "1", "2"]) {
+    const { app, f } = appWith(hops);
+    const res = await invokeApp(app, refreshRequest(xff));
+    assert.equal(res.status, 200);
+    seen[hops] = (f.callsTo("/public/mcp/sessions/refresh")[0].body as any).ipAddress;
+  }
+  assert.deepEqual(seen, { "0": "10.0.0.1", "1": "203.0.113.5", "2": "7.7.7.7" });
+});
+
+test("app: sin TRUST_PROXY_HOPS se confía en 1 salto", async () => {
+  const { app, f } = appWith(undefined);
+  await invokeApp(app, refreshRequest("6.6.6.6, 203.0.113.5"));
+  assert.equal((f.callsTo("/public/mcp/sessions/refresh")[0].body as any).ipAddress, "203.0.113.5");
+});
+
+test("app: /oauth/token con JSON roto responde 400 JSON OAuth y no llega al handler ni a la API", async () => {
+  const { app, f } = appWith("1");
+  const res = await invokeApp(app, { method: "POST", url: "/oauth/token", headers: { "content-type": "application/json" }, body: '{"refresh_token": roto' });
+  assert.equal(res.status, 400);
+  assert.match(String(res.headers["content-type"]), /application\/json/);
+  assert.equal(JSON.parse(res.body).error, "invalid_request");
+  assert.equal(f.calls.length, 0);
+});
+
+test("app: error de parser en /oauth/register y /oauth/revoke es JSON OAuth; en authorize y login-action, página HTML fija", async () => {
+  const { app } = appWith("1");
+  for (const url of ["/oauth/register", "/oauth/revoke"]) {
+    const res = await invokeApp(app, { method: "POST", url, headers: { "content-type": "application/json" }, body: "{roto" });
+    assert.equal(res.status, 400, url);
+    assert.equal(JSON.parse(res.body).error, "invalid_request", url);
+  }
+  for (const url of ["/oauth/login-action", "/oauth/authorize"]) {
+    const res = await invokeApp(app, { method: "POST", url, headers: { "content-type": "application/json" }, body: "SEEDED-visible-123" });
+    assert.equal(res.status, 400, url);
+    assert.match(String(res.headers["content-type"]), /text\/html/, url);
+    assert.match(res.body, /<html/);
+    assert.equal(res.body.includes("SEEDED-visible-123"), false, "la página no refleja el cuerpo");
+  }
+});
+
+test("app: /mcp sigue delegando sus errores a Express (no los convierte en respuesta OAuth)", async () => {
+  const { app } = appWith("1");
+  const { result: broken } = await captureConsole(() =>
+    invokeApp(app, { method: "POST", url: "/mcp", headers: { "content-type": "application/json" }, body: "{roto" })
+  );
+  assert.equal(broken.status, 400);
+  assert.match(String(broken.headers["content-type"]), /text\/html/);
+  assert.equal(broken.body.includes("invalid_request"), false);
+
+  const noAuth = await invokeApp(app, { method: "POST", url: "/mcp", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(noAuth.status, 401);
+  assert.match(String(noAuth.headers["www-authenticate"]), /resource_metadata="https:\/\/mcp\.test\/\.well-known\/oauth-protected-resource"/);
+  const get = await invokeApp(app, { method: "GET", url: "/mcp" });
+  assert.equal(get.status, 405);
 });
 
 // ---------------- cliente HTTP real (adaptador falso) ----------------
@@ -149,11 +216,13 @@ function parserError(raw: string, contentType = "application/json"): Promise<any
   });
 }
 
-test("error de body-parser en /oauth/*: 400 invalid_request JSON, sin cuerpo ni error en logs ni respuesta", async () => {
+test("error de body-parser en /oauth/*: 400 invalid_request JSON, sin cuerpo, mensaje ni error en logs ni respuesta", async () => {
   const seed = "SEEDED-token-9f2";
-  const err = await parserError(`{"refresh_token":"${seed}", roto`);
+  // JSON estricto sin comillas: el SyntaxError de body-parser incluye el principio del cuerpo en el MENSAJE.
+  const err = await parserError(seed);
   assert.ok(err?.status >= 400 && err.status < 500, "error 4xx real del parser");
   assert.ok(String(err.body).includes(seed), "el parser adjunta el cuerpo crudo al error");
+  assert.ok(String(err.message).includes(seed), "el mensaje del error contiene el token sembrado");
 
   const logs: string[] = [];
   const handler = createOauthErrorHandler((m) => logs.push(m));
@@ -166,6 +235,30 @@ test("error de body-parser en /oauth/*: 400 invalid_request JSON, sin cuerpo ni 
   assert.equal(res.headers["cache-control"], "no-store");
   assert.equal(`${JSON.stringify(res.body)}${logs.join("\n")}${output}`.includes(seed), false);
   assert.ok(logs.length === 1);
+  assert.match(logs[0], /status=400 name=SyntaxError code=entity\.parse\.failed/);
+});
+
+test("error de parser: se registra el nombre y el código/tipo (sin mensaje), también en el 503 de rutas no previstas", () => {
+  const logs: string[] = [];
+  const handler = createOauthErrorHandler((m) => logs.push(m));
+  const weird = Object.assign(new TypeError("mensaje-secreto"), { code: "ERR_X" });
+  handler(weird, { path: "/oauth/register" } as any, fakeRes() as any, () => {});
+  handler(Object.assign(new Error("mensaje-secreto"), { name: "malo con espacios y \n" }), { path: "/oauth/authorize" } as any, fakeRes() as any, () => {});
+  assert.match(logs[0], /name=TypeError code=ERR_X/);
+  assert.match(logs[1], /name=n\/a/);
+  assert.equal(logs.join().includes("mensaje-secreto"), false);
+});
+
+test("error handler: con la respuesta ya enviada delega a Express y no escribe nada", () => {
+  const handler = createOauthErrorHandler(() => {});
+  const res = fakeRes();
+  res.headersSent = true;
+  let delegated: unknown;
+  const err = new Error("tarde");
+  handler(err, { path: "/oauth/token" } as any, res as any, (e?: unknown) => { delegated = e; });
+  assert.equal(delegated, err);
+  assert.equal(res.body, undefined);
+  assert.equal(res.statusCode, 200);
 });
 
 test("error de cuerpo demasiado grande (4xx) también es invalid_request", () => {
@@ -243,6 +336,14 @@ test("assertAdministrator: 200 { administrator: false } se rechaza", async () =>
   const out = await createGocAuthApi(f.http).assertAdministrator("jwt");
   assert.equal(out.ok, false);
   assert.equal((out as any).kind, "rejected");
+});
+
+test("assertAdministrator: administrator no booleano (\"false\", 1, \"true\") se rechaza: solo `true` estricto pasa", async () => {
+  for (const administrator of ["false", "true", 1, "yes", null, {}]) {
+    const out = await createGocAuthApi(fakeHttp({ "GET /permissions/admin-access": { status: 200, data: { administrator } } }).http).assertAdministrator("jwt");
+    assert.equal(out.ok, false, JSON.stringify(administrator));
+    assert.equal((out as any).kind, "rejected", JSON.stringify(administrator));
+  }
 });
 
 test("assertAdministrator: 200 sin el campo administrator se rechaza; 200 true pasa; 500 es indisponible", async () => {

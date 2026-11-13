@@ -1,4 +1,7 @@
-import type { Router } from "express";
+import { Readable } from "node:stream";
+import { ServerResponse } from "node:http";
+import type { IncomingMessage } from "node:http";
+import type { Express, Router } from "express";
 import { createGocAuthApi } from "../src/oauth/goc-auth-api.js";
 import type { HttpClient, HttpResponse } from "../src/oauth/goc-auth-api.js";
 import { createOauthRouter } from "../src/oauth/routes.js";
@@ -124,19 +127,59 @@ export async function runRoute(router: Router, method: "get" | "post", path: str
   return res;
 }
 
-export function buildRouter(http: HttpClient, overrides: Partial<OauthDeps> = {}) {
+export function buildDeps(http: HttpClient, overrides: Partial<OauthDeps> = {}) {
   const logs: string[] = [];
   const events: Array<{ jwt: string; event: any }> = [];
   const api = createGocAuthApi(http, (jwt, event) => events.push({ jwt, event }));
-  const router = createOauthRouter({
+  const deps: OauthDeps = {
     api,
     mcpBaseUrl: "https://mcp.test",
     getClientMeta: async (clientId) => (clientId ? { client_id: clientId, client_name: "Test Agent" } : {}),
     registerClient: async () => {},
     log: (m) => logs.push(m),
     ...overrides,
+  };
+  return { deps, logs, events };
+}
+
+export function buildRouter(http: HttpClient, overrides: Partial<OauthDeps> = {}) {
+  const { deps, logs, events } = buildDeps(http, overrides);
+  return { router: createOauthRouter(deps), logs, events };
+}
+
+export interface AppResponse {
+  status: number;
+  headers: Record<string, string | string[] | number | undefined>;
+  body: string;
+}
+
+// Ejecuta la app completa (parsers, router, manejador de errores) sin abrir un puerto.
+export function invokeApp(
+  app: Express,
+  opts: { method: string; url: string; headers?: Record<string, string>; body?: string; remoteAddress?: string }
+): Promise<AppResponse> {
+  const buffer = Buffer.from(opts.body ?? "");
+  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+  if (opts.body !== undefined) headers["content-length"] = String(buffer.length);
+  const req = Object.assign(Readable.from(opts.body === undefined ? [] : [buffer]), {
+    method: opts.method,
+    url: opts.url,
+    headers,
+    socket: { remoteAddress: opts.remoteAddress ?? "10.0.0.1" },
+    connection: { remoteAddress: opts.remoteAddress ?? "10.0.0.1" },
   });
-  return { router, logs, events };
+  return new Promise((resolve, reject) => {
+    const res = new ServerResponse(req as unknown as IncomingMessage);
+    const chunks: Buffer[] = [];
+    res.write = ((chunk: unknown) => { chunks.push(Buffer.from(chunk as any)); return true; }) as any;
+    res.end = ((chunk?: unknown) => {
+      if (chunk) chunks.push(Buffer.from(chunk as any));
+      resolve({ status: res.statusCode, headers: res.getHeaders() as AppResponse["headers"], body: Buffer.concat(chunks).toString() });
+      return res;
+    }) as any;
+    // Sin callback final: Express usa su finalhandler, igual que en producción.
+    try { app.handle(req as any, res as any); } catch (err) { reject(err); }
+  });
 }
 
 // Captura todo lo que salga por consola mientras corre `fn`.

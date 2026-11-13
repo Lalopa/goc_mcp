@@ -9,10 +9,8 @@ export const TOKEN_RATE_LIMIT: RateLimitConfig = { max: 60, windowMs: 60 * 1000 
 export const LOGIN_RATE_LIMIT: RateLimitConfig = { max: 10, windowMs: 5 * 60 * 1000 };
 export const REVOKE_RATE_LIMIT: RateLimitConfig = { max: 30, windowMs: 60 * 1000 };
 
-/** Tope de claves (cubos) por limitador: acota la memoria y el costo de cada barrida. */
+/** Tope de claves (cubos) por limitador: acota la memoria. */
 export const MAX_RATE_LIMIT_KEYS = 10_000;
-/** Con el Map lleno se permite barrer a lo sumo una vez por este intervalo. */
-export const FULL_SWEEP_MIN_INTERVAL_MS = 1000;
 
 export interface Bucket {
   count: number;
@@ -30,22 +28,31 @@ export interface RateLimiterOptions {
   maxKeys?: number;
   /** Inyectable para observar cuántas veces se recorre. */
   store?: Map<string, Bucket>;
+  /** Aviso de Map lleno (como mucho uno por ventana). Sin claves ni IPs. */
+  onFull?: () => void;
 }
 
 // Ventana fija en memoria (una sola instancia, igual que el store de códigos).
-// - La barrida de vencidos ocurre a lo sumo una vez por ventana, no en cada hit.
-// - El Map nunca pasa de `maxKeys`: con el Map lleno una clave nueva se responde como excedida y no crea
-//   cubo (con claves rotadas, quien ataca se frena a sí mismo; una clave ya existente sigue contando).
+//
+// Invariante: el orden de inserción del Map es el orden de `resetAt`. Un cubo solo se inserta con
+// `resetAt = now + windowMs` (con `now` creciente) y nunca se modifica su `resetAt`; el cubo propio
+// vencido se BORRA y se vuelve a insertar (un `set` sobre una clave existente conservaría su posición
+// antigua y rompería el orden). Por eso:
+// - la barrida de vencidos solo mira el principio del Map y se detiene en el primer cubo vigente
+//   (costo proporcional a lo que borra, no al tamaño del Map);
+// - con el Map lleno se desaloja el primero, que es el que vence antes (O(1)), y se admite la clave
+//   nueva: quien rote claves no puede dejar sin servicio a los demás, solo reinicia cubos antiguos.
 export function createRateLimiter(config: RateLimitConfig, options: RateLimiterOptions = {}): RateLimiter {
   const buckets = options.store ?? new Map<string, Bucket>();
   const maxKeys = options.maxKeys ?? MAX_RATE_LIMIT_KEYS;
-  let lastSweepAt: number | null = null;
+  const onFull = options.onFull ?? (() => console.warn("oauth: limitador de tasa lleno; se desalojan los cubos más antiguos"));
+  let lastFullLogAt: number | null = null;
 
   function sweep(now: number): void {
     for (const [key, bucket] of buckets) {
-      if (now >= bucket.resetAt) buckets.delete(key);
+      if (now < bucket.resetAt) break;
+      buckets.delete(key);
     }
-    lastSweepAt = now;
   }
 
   const retryAfter = (resetAt: number, now: number) => Math.max(1, Math.ceil((resetAt - now) / 1000));
@@ -53,8 +60,7 @@ export function createRateLimiter(config: RateLimitConfig, options: RateLimiterO
   return {
     size: () => buckets.size,
     hit(key, now = Date.now()) {
-      if (lastSweepAt === null) lastSweepAt = now;
-      else if (now - lastSweepAt >= config.windowMs) sweep(now);
+      sweep(now);
 
       let bucket = buckets.get(key);
       if (bucket && now >= bucket.resetAt) {
@@ -62,8 +68,14 @@ export function createRateLimiter(config: RateLimitConfig, options: RateLimiterO
         bucket = undefined;
       }
       if (!bucket) {
-        if (buckets.size >= maxKeys && now - (lastSweepAt ?? now) >= FULL_SWEEP_MIN_INTERVAL_MS) sweep(now);
-        if (buckets.size >= maxKeys) return Math.max(1, Math.ceil(config.windowMs / 1000));
+        if (buckets.size >= maxKeys) {
+          const oldest = buckets.keys().next();
+          if (!oldest.done) buckets.delete(oldest.value);
+          if (lastFullLogAt === null || now - lastFullLogAt >= config.windowMs) {
+            lastFullLogAt = now;
+            onFull();
+          }
+        }
         bucket = { count: 0, resetAt: now + config.windowMs };
         buckets.set(key, bucket);
       }
@@ -73,11 +85,14 @@ export function createRateLimiter(config: RateLimitConfig, options: RateLimiterO
   };
 }
 
-// La clave es req.ip. Su valor depende de `trust proxy` (src/index.ts, variable TRUST_PROXY_HOPS, por
-// defecto 1 salto: EC2 + nginx): con N saltos Express toma la IP que el N-ésimo proxy de confianza vio
-// conectarse, y lo que el cliente escriba en X-Forwarded-For a su izquierda no cuenta. Si el número de
-// saltos no coincide con el despliegue, o la IP del cliente es falsificable (más saltos reales que
-// configurados) o todos comparten la del proxy (menos).
+// La clave es req.ip. Su valor depende de `trust proxy` (src/app.ts, variable TRUST_PROXY_HOPS, por
+// defecto 1 salto: EC2 + nginx). Con N saltos Express toma la N-ésima dirección contando desde la
+// conexión (proxy-addr: se confía en las N primeras y se devuelve la siguiente). Si el número no
+// coincide con el despliegue:
+// - más saltos REALES que configurados: req.ip es la IP de un proxy exterior y todos los clientes la
+//   comparten (un solo cubo para todos);
+// - menos saltos reales que configurados: req.ip es un valor que escribió el cliente en X-Forwarded-For
+//   y es falsificable (el limitador se evade rotándolo).
 export function rateLimitMiddleware(
   limiter: RateLimiter,
   onLimit: (req: Request, res: Response, retryAfterSeconds: number) => void
