@@ -1,345 +1,365 @@
 import { Router } from "express";
-import axios from "axios";
+import type { Request, RequestHandler, Response } from "express";
 import { renderLoginPage } from "./login-page.js";
-import { createCode, redeemCode, generateRefreshToken } from "./store.js";
-import { registerOAuthClientInApi, getClientTrackingMetadata } from "./client-registry.js";
-import { GocApiClient, GocApiError } from "../api-client.js";
-import { McpTracker } from "../tracker.js";
+import { createCode, redeemCode } from "./store.js";
+import type { GocAuthApi } from "./goc-auth-api.js";
+import { secondsUntilExpiry } from "./jwt.js";
+import {
+  LOGIN_RATE_LIMIT,
+  REVOKE_RATE_LIMIT,
+  TOKEN_RATE_LIMIT,
+  createRateLimiter,
+  rateLimitMiddleware,
+} from "./rate-limit.js";
+import type { RateLimitConfig } from "./rate-limit.js";
 
-const GOC_API_URL = process.env.GOC_API_URL!;
-const MCP_BASE_URL = process.env.MCP_BASE_URL!;
+export interface OauthDeps {
+  api: GocAuthApi;
+  mcpBaseUrl: string;
+  /** Metadatos del cliente OAuth para el tracking. No debe lanzar. */
+  getClientMeta(clientId: string | undefined): Promise<Record<string, string>>;
+  registerClient(data: {
+    clientId: string;
+    clientName: string;
+    redirectUris: string[];
+    tokenEndpointAuthMethod?: string;
+  }): Promise<void>;
+  /** Solo recibe mensajes sin tokens ni datos del usuario. */
+  log?: (message: string) => void;
+  limits?: { token?: RateLimitConfig; login?: RateLimitConfig; revoke?: RateLimitConfig };
+}
 
-const ACCESS_TOKEN_TTL_SECONDS = 7200; // 2h — matches GOC API JWT expiry
+const TEMPORARILY_UNAVAILABLE = "temporarily_unavailable";
 
-export const oauthRouter = Router();
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
 
-// Protected Resource Metadata (RFC 9728) — tells Claude where to authenticate.
-// Required by the modern MCP authorization spec so the client can re-auth on 401.
-oauthRouter.get("/.well-known/oauth-protected-resource", (_req, res) => {
-  res.json({
-    resource: MCP_BASE_URL,
-    authorization_servers: [MCP_BASE_URL],
-    scopes_supported: ["read", "permissions:write"],
-    bearer_methods_supported: ["header"],
-  });
-});
+function noStore(res: Response): void {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+}
 
-oauthRouter.get("/.well-known/oauth-authorization-server", (_req, res) => {
-  res.json({
-    issuer: MCP_BASE_URL,
-    authorization_endpoint: `${MCP_BASE_URL}/oauth/authorize`,
-    token_endpoint: `${MCP_BASE_URL}/oauth/token`,
-    registration_endpoint: `${MCP_BASE_URL}/oauth/register`,
-    revocation_endpoint: `${MCP_BASE_URL}/oauth/revoke`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
-    code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none"],
-    revocation_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["read", "permissions:write"],
-  });
-});
+function oauthError(res: Response, status: number, error: string, description: string): void {
+  noStore(res);
+  res.status(status).json({ error, error_description: description });
+}
 
-oauthRouter.post("/oauth/register", async (req, res) => {
-  const { redirect_uris, client_name, token_endpoint_auth_method } = req.body as Record<string, unknown>;
+function unavailable(res: Response): void {
+  oauthError(res, 503, TEMPORARILY_UNAVAILABLE, "Authorization service temporarily unavailable");
+}
 
-  if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
-    res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris required" });
-    return;
-  }
+export function createOauthRouter(deps: OauthDeps): Router {
+  const { api, mcpBaseUrl } = deps;
+  const log = deps.log ?? ((message: string) => console.warn(message));
+  const router = Router();
 
-  const client_id = crypto.randomUUID();
-  const resolvedClientName = typeof client_name === "string" && client_name.trim()
-    ? client_name.trim()
-    : "MCP Client";
-
-  try {
-    await registerOAuthClientInApi({
-      clientId: client_id,
-      clientName: resolvedClientName,
-      redirectUris: redirect_uris as string[],
-      tokenEndpointAuthMethod: typeof token_endpoint_auth_method === "string"
-        ? token_endpoint_auth_method
-        : "none",
-    });
-  } catch {
-    res.status(500).json({
-      error: "server_error",
-      error_description: "Could not persist OAuth client registration",
-    });
-    return;
-  }
-
-  res.status(201).json({
-    client_id,
-    client_name: resolvedClientName,
-    redirect_uris,
-    token_endpoint_auth_method: token_endpoint_auth_method ?? "none",
-    grant_types: ["authorization_code", "refresh_token"],
-    response_types: ["code"],
-  });
-});
-
-oauthRouter.get("/oauth/authorize", (req, res) => {
-  const { redirect_uri, state, client_id, error } = req.query as Record<string, string>;
-
-  if (!redirect_uri) {
-    res.status(400).send("Missing redirect_uri");
-    return;
-  }
-
-  res.send(renderLoginPage({ redirect_uri, state, client_id, error }));
-});
-
-oauthRouter.post("/oauth/login-action", async (req, res) => {
-  const { username, password, redirect_uri, state, client_id } = req.body as Record<string, string>;
-
-  if (!redirect_uri) {
-    res.status(400).send("Missing redirect_uri");
-    return;
-  }
-
-  try {
-    const response = await axios.post(`${GOC_API_URL}/auth/login`, { username, password });
-    const jwt: string = response.data?.token ?? response.data?.data?.accessToken ?? response.data?.accessToken;
-    const gocRefreshToken: string = response.data?.refreshToken ?? response.data?.data?.refreshToken ?? "";
-
-    if (!jwt) {
-      const errorUrl = buildUrl("/oauth/authorize", { redirect_uri, state, client_id, error: "No token received" });
-      res.redirect(errorUrl);
-      return;
+  const tokenLimit = rateLimitMiddleware(
+    createRateLimiter(deps.limits?.token ?? TOKEN_RATE_LIMIT),
+    (_req, res, retryAfter) => {
+      res.setHeader("Retry-After", String(retryAfter));
+      oauthError(res, 429, TEMPORARILY_UNAVAILABLE, "Too many requests");
     }
-
-    await new GocApiClient(jwt).assertAdministrator();
-    const code = createCode(jwt, gocRefreshToken, redirect_uri);
-    const callbackUrl = buildUrl(redirect_uri, { code, state });
-    res.redirect(callbackUrl);
-  } catch (err: unknown) {
-    const message = extractErrorMessage(err);
-    const clientMeta = await getClientTrackingMetadata(client_id);
-
-    // Fire-and-forget: log auth failure event
-    logEventSafe(undefined, {
-      eventType: "auth_failure",
-      clientId: client_id,
-      description: `Login failed for user "${req.body?.username ?? "unknown"}" (${clientMeta.client_name ?? "unknown agent"}): ${message}`,
-      metadata: clientMeta,
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    const errorUrl = buildUrl("/oauth/authorize", { redirect_uri, state, client_id, error: message });
-    res.redirect(errorUrl);
-  }
-});
-
-oauthRouter.post("/oauth/token", async (req, res) => {
-  const { grant_type, code, redirect_uri, refresh_token, client_id } = req.body as Record<string, string>;
-
-  // --- Authorization code grant ---
-  if (grant_type === "authorization_code") {
-    if (!code || !redirect_uri) {
-      res.status(400).json({ error: "invalid_request", error_description: "Missing code or redirect_uri" });
-      return;
+  );
+  const revokeLimit = rateLimitMiddleware(
+    createRateLimiter(deps.limits?.revoke ?? REVOKE_RATE_LIMIT),
+    (_req, res, retryAfter) => {
+      res.setHeader("Retry-After", String(retryAfter));
+      oauthError(res, 429, TEMPORARILY_UNAVAILABLE, "Too many requests");
     }
-
-    const result = redeemCode(code, redirect_uri);
-    if (!result) {
-      res.status(400).json({ error: "invalid_grant", error_description: "Code expired or invalid" });
-      return;
-    }
-
-    try {
-      await new GocApiClient(result.jwt).assertAdministrator();
-    } catch (error) {
-      const denied = error instanceof GocApiError && (error.status === 401 || error.status === 403);
-      res.status(denied ? 400 : 503).json({ error: denied ? "invalid_grant" : "temporarily_unavailable", error_description: "Active administrator access could not be verified" });
-      return;
-    }
-
-    const mcpRefreshToken = generateRefreshToken();
-    const clientMeta = await getClientTrackingMetadata(client_id);
-
-    // Fire-and-forget: create session and log event in the API
-    const apiClient = new GocApiClient(result.jwt);
-    const tracker = new McpTracker(apiClient);
-
-    await tracker.createSession({
-      mcpRefreshToken,
-      gocRefreshToken: result.gocRefreshToken,
-      clientId: client_id,
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-      metadata: clientMeta,
-    }).catch(() => {});
-
-    tracker.logEvent({
-      eventType: "auth_success",
-      clientId: client_id,
-      description: `User authenticated via OAuth (${clientMeta.client_name ?? "unknown agent"})`,
-      metadata: clientMeta,
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-    });
-
-    res.json({
-      access_token: result.jwt,
-      token_type: "Bearer",
-      expires_in: ACCESS_TOKEN_TTL_SECONDS,
-      refresh_token: mcpRefreshToken,
-    });
-    return;
-  }
-
-  // --- Refresh token grant ---
-  if (grant_type === "refresh_token") {
-    if (!refresh_token) {
-      res.status(400).json({ error: "invalid_request", error_description: "Missing refresh_token" });
-      return;
-    }
-
-    const clientMeta = await getClientTrackingMetadata(client_id);
-
-    // Look up the session in the API to get the GOC refresh token
-    // We need a JWT to call the API, but we only have the expired one.
-    // The GOC API's /auth/refresh endpoint uses `authenticateIgnoreExpiration` middleware,
-    // so we can use the expired JWT to call it.
-    // However, we need to find the session first. We'll try to find it via a GET endpoint.
-
-    // First, try to get session data from the API using a temporary client
-    // We need some JWT to authenticate to the API — use a minimal approach:
-    // Extract the expired JWT from the Authorization header if present
-    const authHeader = req.headers.authorization ?? "";
-    const expiredJwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-
-    if (!expiredJwt) {
-      res.status(400).json({ error: "invalid_grant", error_description: "Authorization header with expired token is required for refresh" });
-      return;
-    }
-
-    const apiClient = new GocApiClient(expiredJwt);
-    const tracker = new McpTracker(apiClient);
-
-    try {
-      const session = await tracker.findSessionByToken(refresh_token);
-      if (!session) {
-        res.status(400).json({ error: "invalid_grant", error_description: "Refresh token invalid or expired" });
+  );
+  const loginLimit = rateLimitMiddleware(
+    createRateLimiter(deps.limits?.login ?? LOGIN_RATE_LIMIT),
+    (req, res, retryAfter) => {
+      res.setHeader("Retry-After", String(retryAfter));
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const redirect_uri = str(body.redirect_uri);
+      if (!redirect_uri) {
+        res.status(429).send("Too many attempts");
         return;
       }
-
-      // Call GOC API to refresh the token
-      const response = await axios.post(
-        `${GOC_API_URL}/auth/refresh`,
-        { refreshToken: session.gocRefreshToken },
-        { headers: { Authorization: `Bearer ${expiredJwt}` } }
+      res.redirect(
+        buildUrl("/oauth/authorize", {
+          redirect_uri,
+          state: str(body.state),
+          client_id: str(body.client_id),
+          error: "Too many attempts. Please wait a few minutes and try again.",
+        })
       );
+    }
+  );
 
-      const newJwt: string = response.data?.token ?? response.data?.data?.accessToken ?? "";
-      const newGocRefresh: string = response.data?.refreshToken ?? response.data?.data?.refreshToken ?? "";
+  // Protected Resource Metadata (RFC 9728) — tells Claude where to authenticate.
+  // Required by the modern MCP authorization spec so the client can re-auth on 401.
+  router.get("/.well-known/oauth-protected-resource", (_req, res) => {
+    res.json({
+      resource: mcpBaseUrl,
+      authorization_servers: [mcpBaseUrl],
+      scopes_supported: ["read", "permissions:write"],
+      bearer_methods_supported: ["header"],
+    });
+  });
 
-      if (!newJwt) {
-        tracker.logEvent({
-          eventType: "token_refresh_failed",
-          clientId: client_id,
-          metadata: clientMeta,
-          description: `GOC API did not return a new token (${clientMeta.client_name ?? "unknown agent"})`,
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"],
-        });
-        res.status(400).json({ error: "invalid_grant", error_description: "Could not refresh upstream token" });
-        return;
-      }
+  router.get("/.well-known/oauth-authorization-server", (_req, res) => {
+    res.json({
+      issuer: mcpBaseUrl,
+      authorization_endpoint: `${mcpBaseUrl}/oauth/authorize`,
+      token_endpoint: `${mcpBaseUrl}/oauth/token`,
+      registration_endpoint: `${mcpBaseUrl}/oauth/register`,
+      revocation_endpoint: `${mcpBaseUrl}/oauth/revoke`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["none"],
+      revocation_endpoint_auth_methods_supported: ["none"],
+      scopes_supported: ["read", "permissions:write"],
+    });
+  });
 
-      const newMcpRefreshToken = generateRefreshToken();
+  router.post("/oauth/register", async (req, res) => {
+    const { redirect_uris, client_name, token_endpoint_auth_method } = (req.body ?? {}) as Record<string, unknown>;
 
-      // Update session with new tokens
-      const newApiClient = new GocApiClient(newJwt);
-      await newApiClient.assertAdministrator();
-      const newTracker = new McpTracker(newApiClient);
-      newTracker.bindSession(session.id);
-      newTracker.setRequestContext({
-        ipAddress: req.ip,
-        userAgent: req.headers["user-agent"],
-      });
+    if (!Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+      res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris required" });
+      return;
+    }
 
-      newTracker.logEvent({
-        eventType: "token_refresh",
+    const client_id = crypto.randomUUID();
+    const resolvedClientName = typeof client_name === "string" && client_name.trim()
+      ? client_name.trim()
+      : "MCP Client";
+
+    try {
+      await deps.registerClient({
         clientId: client_id,
-        metadata: clientMeta,
-        description: `Token refreshed (${clientMeta.client_name ?? "unknown agent"})`,
-        ipAddress: req.ip,
-        userAgent: req.headers["user-agent"],
-      });
-
-      // Update the session in the DB
-      newApiClient.patch(`/mcp/sessions/${session.id}`, {
-        mcpRefreshToken: newMcpRefreshToken,
-        gocRefreshToken: newGocRefresh,
-        status: "active",
-        lastActivityAt: new Date().toISOString(),
-      }).catch(() => {});
-
-      res.json({
-        access_token: newJwt,
-        token_type: "Bearer",
-        expires_in: ACCESS_TOKEN_TTL_SECONDS,
-        refresh_token: newMcpRefreshToken,
+        clientName: resolvedClientName,
+        redirectUris: redirect_uris as string[],
+        tokenEndpointAuthMethod: typeof token_endpoint_auth_method === "string"
+          ? token_endpoint_auth_method
+          : "none",
       });
     } catch {
-      tracker.logEvent({
-        eventType: "token_refresh_failed",
-        clientId: client_id,
+      res.status(500).json({
+        error: "server_error",
+        error_description: "Could not persist OAuth client registration",
+      });
+      return;
+    }
+
+    res.status(201).json({
+      client_id,
+      client_name: resolvedClientName,
+      redirect_uris,
+      token_endpoint_auth_method: token_endpoint_auth_method ?? "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    });
+  });
+
+  router.get("/oauth/authorize", (req, res) => {
+    const { redirect_uri, state, client_id, error } = req.query as Record<string, string>;
+
+    if (!redirect_uri) {
+      res.status(400).send("Missing redirect_uri");
+      return;
+    }
+
+    res.send(renderLoginPage({ redirect_uri, state, client_id, error }));
+  });
+
+  router.post("/oauth/login-action", loginLimit, async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const username = str(body.username);
+    const password = str(body.password);
+    const redirect_uri = str(body.redirect_uri);
+    const state = str(body.state);
+    const client_id = str(body.client_id);
+
+    if (!redirect_uri) {
+      res.status(400).send("Missing redirect_uri");
+      return;
+    }
+
+    const fail = (message: string, reason: string) => {
+      // Sin usuario, contraseña ni el mensaje de la API.
+      log(`oauth login fallido: ${reason}`);
+      res.redirect(buildUrl("/oauth/authorize", { redirect_uri, state, client_id, error: message }));
+    };
+
+    try {
+      if (!username || !password) {
+        fail("Invalid credentials", "faltan credenciales");
+        return;
+      }
+
+      const login = await api.login(username, password);
+      if (!login.ok) {
+        fail(login.message, "login rechazado");
+        return;
+      }
+
+      const admin = await api.assertAdministrator(login.jwt);
+      if (!admin.ok) {
+        fail(
+          admin.kind === "rejected" ? "Administrator access required" : "Service temporarily unavailable",
+          `verificación de administrador ${admin.kind} status=${admin.status ?? "n/a"}`
+        );
+        return;
+      }
+
+      const code = createCode({ jwt: login.jwt, gocRefreshToken: login.gocRefreshToken, redirect_uri });
+      res.redirect(buildUrl(redirect_uri, { code, state }));
+    } catch {
+      fail("Unexpected error", "error inesperado");
+    }
+  });
+
+  router.post("/oauth/token", tokenLimit, guardJson(log, async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const grant_type = str(body.grant_type);
+    const clientId = str(body.client_id);
+    const caller = { ipAddress: req.ip, userAgent: req.headers["user-agent"] };
+
+    // --- Authorization code grant ---
+    if (grant_type === "authorization_code") {
+      const code = str(body.code);
+      const redirect_uri = str(body.redirect_uri);
+      // Se valida todo antes de redimir: un request incompleto no debe quemar el código.
+      if (!code || !redirect_uri || !clientId) {
+        oauthError(res, 400, "invalid_request", "Missing code, redirect_uri or client_id");
+        return;
+      }
+
+      const result = redeemCode(code, { redirect_uri });
+      if (!result) {
+        oauthError(res, 400, "invalid_grant", "Code expired or invalid");
+        return;
+      }
+
+      const admin = await api.assertAdministrator(result.jwt);
+      if (!admin.ok) {
+        if (admin.kind === "rejected") {
+          oauthError(res, 400, "invalid_grant", "Active administrator access could not be verified");
+        } else {
+          log(`oauth canje: verificación de administrador no disponible status=${admin.status ?? "n/a"}`);
+          unavailable(res);
+        }
+        return;
+      }
+
+      const clientMeta = await deps.getClientMeta(clientId);
+      const session = await api.createSession(result.jwt, {
+        gocRefreshToken: result.gocRefreshToken,
+        clientId,
+        ...caller,
         metadata: clientMeta,
-        description: `Upstream refresh failed (${clientMeta.client_name ?? "unknown agent"}) — user must re-authenticate`,
-        ipAddress: req.ip,
-        userAgent: req.headers["user-agent"],
+      });
+      if (!session.ok) {
+        log(`oauth canje: alta de sesión ${session.kind} status=${session.status ?? "n/a"}`);
+        if (session.kind === "rejected") {
+          oauthError(res, 400, "invalid_grant", "Session could not be created");
+        } else {
+          unavailable(res);
+        }
+        return;
+      }
+
+      api.logEvent(result.jwt, {
+        eventType: "auth_success",
+        clientId,
+        description: `User authenticated via OAuth (${clientMeta.client_name ?? "unknown agent"})`,
+        metadata: clientMeta,
+        ...caller,
       });
 
-      res.status(400).json({ error: "invalid_grant", error_description: "Upstream refresh failed — please re-authenticate" });
+      noStore(res);
+      res.json({
+        access_token: result.jwt,
+        token_type: "Bearer",
+        ...optionalExpiresIn(secondsUntilExpiry(result.jwt)),
+        refresh_token: session.data.refreshToken,
+      });
+      return;
     }
-    return;
-  }
 
-  res.status(400).json({ error: "unsupported_grant_type" });
-});
-
-// --- Token revocation (RFC 7009) ---
-// Claude uses this to show Disconnect button
-oauthRouter.post("/oauth/revoke", (req, res) => {
-  const { token } = req.body as Record<string, string>;
-
-  if (!token) {
-    res.status(200).json({});
-    return;
-  }
-
-  // Try to invalidate the session in the API using the token as auth
-  const authHeader = req.headers.authorization ?? "";
-  const jwt = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : token;
-
-  const apiClient = new GocApiClient(jwt);
-  const tracker = new McpTracker(apiClient);
-
-  tracker.findSessionByToken(token)
-    .then(async (session) => {
-      if (session) {
-        tracker.bindSession(session.id);
-        tracker.updateSession(session.id, { status: "revoked" }).catch(() => {});
-        tracker.logEvent({
-          eventType: "token_revoked",
-          clientId: session.clientId ?? undefined,
-          metadata: await getClientTrackingMetadata(session.clientId ?? undefined),
-          description: "User disconnected via OAuth revocation",
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"],
-        });
+    // --- Refresh token grant ---
+    if (grant_type === "refresh_token") {
+      const refreshToken = str(body.refresh_token);
+      if (!refreshToken || !clientId) {
+        oauthError(res, 400, "invalid_request", "Missing refresh_token or client_id");
+        return;
       }
-    })
-    .catch(() => {});
 
-  // RFC 7009: always return 200, even if token is invalid
-  res.status(200).json({});
-});
+      // Sin encabezado Authorization: la credencial es el refresh token del cuerpo.
+      const refreshed = await api.refreshSession({ refreshToken, clientId, ...caller });
+      if (!refreshed.ok) {
+        log(`oauth refresh ${refreshed.kind} status=${refreshed.status ?? "n/a"}`);
+        if (refreshed.kind === "rejected") {
+          oauthError(res, 400, "invalid_grant", "Refresh token invalid or expired");
+        } else {
+          unavailable(res);
+        }
+        return;
+      }
+
+      noStore(res);
+      res.json({
+        access_token: refreshed.data.accessToken,
+        token_type: "Bearer",
+        expires_in: refreshed.data.expiresIn,
+        refresh_token: refreshed.data.refreshToken,
+      });
+      return;
+    }
+
+    oauthError(res, 400, "unsupported_grant_type", "Unsupported grant_type");
+  }));
+
+  // --- Token revocation (RFC 7009) ---
+  // Claude uses this to show Disconnect button
+  router.post("/oauth/revoke", revokeLimit, guardJson(log, async (req, res) => {
+    const token = str(((req.body ?? {}) as Record<string, unknown>).token);
+
+    if (token) {
+      // El token va a la API tal cual (refresh token o no); la API decide y nunca lo usamos como Bearer.
+      const revoked = await api.revokeSession({ token, ipAddress: req.ip, userAgent: req.headers["user-agent"] });
+      if (!revoked.ok) log(`oauth revoke ${revoked.kind} status=${revoked.status ?? "n/a"}`);
+    }
+
+    // RFC 7009: always return 200, even if token is invalid
+    noStore(res);
+    res.status(200).json({});
+  }, true));
+
+  return router;
+}
+
+function optionalExpiresIn(seconds: number | undefined): { expires_in?: number } {
+  return seconds === undefined ? {} : { expires_in: seconds };
+}
+
+// Ningún camino puede devolver algo que no sea JSON OAuth: un 500 HTML o un error desconocido haría que
+// el cliente abra un login nuevo; temporarily_unavailable conserva sus credenciales.
+function guardJson(
+  log: (message: string) => void,
+  handler: (req: Request, res: Response) => Promise<void>,
+  alwaysOk = false
+): RequestHandler {
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch {
+      log("oauth: error inesperado");
+      if (res.headersSent) return;
+      if (alwaysOk) {
+        noStore(res);
+        res.status(200).json({});
+      } else {
+        unavailable(res);
+      }
+    }
+  };
+}
 
 function buildUrl(base: string, params: Record<string, string | undefined>): string {
   const url = new URL(base.startsWith("http") ? base : `http://placeholder${base}`);
@@ -347,28 +367,4 @@ function buildUrl(base: string, params: Record<string, string | undefined>): str
     if (v !== undefined && v !== "") url.searchParams.set(k, v);
   }
   return base.startsWith("http") ? url.toString() : `${url.pathname}${url.search}`;
-}
-
-function extractErrorMessage(err: unknown): string {
-  if (axios.isAxiosError(err)) {
-    return err.response?.data?.message ?? err.response?.data?.error ?? "Invalid credentials";
-  }
-  if (err instanceof Error) return err.message;
-  return "Unknown error";
-}
-
-function logEventSafe(jwt: string | undefined, event: {
-  eventType: string;
-  clientId?: string;
-  description?: string;
-  metadata?: Record<string, string>;
-  ipAddress?: string;
-  userAgent?: string;
-}): void {
-  if (!jwt) return;
-  try {
-    const client = new GocApiClient(jwt);
-    const tracker = new McpTracker(client);
-    tracker.logEvent(event);
-  } catch {}
 }

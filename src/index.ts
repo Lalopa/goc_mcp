@@ -1,7 +1,8 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { oauthRouter } from "./oauth/routes.js";
+import { createOauthRouter } from "./oauth/routes.js";
+import { createDefaultDeps } from "./oauth/deps.js";
 import { createMcpServer } from "./mcp-server.js";
 import { GocApiClient, GocApiError } from "./api-client.js";
 import { McpTracker } from "./tracker.js";
@@ -12,7 +13,7 @@ app.set("trust proxy", true);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use(oauthRouter);
+app.use(createOauthRouter(createDefaultDeps()));
 
 const MCP_BASE_URL = process.env.MCP_BASE_URL!;
 const RESOURCE_METADATA_URL = `${MCP_BASE_URL}/.well-known/oauth-protected-resource`;
